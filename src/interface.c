@@ -284,11 +284,6 @@ static void ne_drain_cq_port(struct ne_zc_port *port,
 	}
 }
 
-void ne_drain_cq_loc(struct ne_pair *p)
-{
-	ne_drain_cq_port(&p->loc, &p->pool_wan);
-}
-
 void ne_drain_cq_wan(struct ne_pair *p)
 {
 	ne_drain_cq_port(&p->wan, &p->pool_loc);

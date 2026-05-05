@@ -60,7 +60,6 @@ void ne_pair_close(struct ne_pair *p);
 int ne_recv_loc(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max);
 void ne_recv_loc_release(struct ne_pair *p, unsigned int n);
 int ne_tx_one_wan(struct ne_pair *p, uint64_t addr, uint32_t len);
-void ne_drain_cq_loc(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);
 void ne_refill_fq_loc(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);

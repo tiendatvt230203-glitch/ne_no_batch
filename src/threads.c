@@ -29,7 +29,6 @@ static void rewrite_eth_to_wan(struct ne_pair *zc, uint64_t addr)
 
 static void ne_maintain(struct ne_ctx *ctx)
 {
-	ne_drain_cq_loc(&ctx->zc);
 	ne_drain_cq_wan(&ctx->zc);
 	ne_refill_fq_loc(&ctx->zc);
 	ne_refill_fq_wan(&ctx->zc);
