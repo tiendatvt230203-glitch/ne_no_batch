@@ -90,7 +90,7 @@ static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
 		.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
 		.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
 		.xdp_flags = XDP_FLAGS_DRV_MODE,
-		.bind_flags = XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY,
+		.bind_flags = XDP_ZEROCOPY,
 	};
 
 	return xsk_socket__create_shared(&port->xsk, ifn, 0, p->umem,
@@ -266,20 +266,15 @@ static int ne_tx_one_port(struct ne_zc_port *port, uint64_t addr, uint32_t len,
 {
 	uint32_t idx;
 	struct xdp_desc *d;
-	int xfd = xsk_socket__fd(port->xsk);
 
 	if (len > max_frame)
 		len = max_frame;
-	if (xsk_ring_prod__reserve(&port->tx, 1, &idx) != 1) {
-		if (xsk_ring_prod__needs_wakeup(&port->tx))
-			(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+	if (xsk_ring_prod__reserve(&port->tx, 1, &idx) != 1)
 		return -1;
-	}
 	d = xsk_ring_prod__tx_desc(&port->tx, idx);
 	d->addr = addr;
 	d->len = len;
 	xsk_ring_prod__submit(&port->tx, 1);
-	(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 	return 0;
 }
 
@@ -338,9 +333,6 @@ static void ne_refill_fq_port(struct ne_zc_port *port,
 		*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
 		xsk_ring_prod__submit(&port->fq, 1);
 	}
-	if (xsk_ring_prod__needs_wakeup(&port->fq))
-		(void)recvfrom(xsk_socket__fd(port->xsk), NULL, 0,
-			       MSG_DONTWAIT, NULL, 0);
 }
 
 void ne_refill_fq_loc(struct ne_pair *p)

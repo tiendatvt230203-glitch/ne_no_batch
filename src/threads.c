@@ -2,21 +2,11 @@
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <linux/if_ether.h>
 
 #include "ne.h"
 #include "mac.h"
-
-static inline void cpu_relax(void)
-{
-#if defined(__x86_64__) || defined(__i386__)
-	__builtin_ia32_pause();
-#else
-	__asm__ volatile("" ::: "memory");
-#endif
-}
 
 static void setaffinity(unsigned int cpu)
 {
@@ -68,10 +58,8 @@ static void *worker(void *arg)
 		if (ne_recv_wan(&ctx->zc, &len, &addr, 1) > 0) {
 			rewrite_eth(&ctx->zc, addr, NE_DIR_TO_LOC);
 			while (!ctx->stop &&
-			       ne_tx_one_loc(&ctx->zc, addr, len) != 0) {
+			       ne_tx_one_loc(&ctx->zc, addr, len) != 0)
 				ne_maintain(ctx);
-				cpu_relax();
-			}
 			if (!ctx->stop)
 				ne_recv_wan_release(&ctx->zc, 1u);
 			continue;
@@ -80,16 +68,12 @@ static void *worker(void *arg)
 		if (ne_recv_loc(&ctx->zc, &len, &addr, 1) > 0) {
 			rewrite_eth(&ctx->zc, addr, NE_DIR_TO_WAN);
 			while (!ctx->stop &&
-			       ne_tx_one_wan(&ctx->zc, addr, len) != 0) {
+			       ne_tx_one_wan(&ctx->zc, addr, len) != 0)
 				ne_maintain(ctx);
-				cpu_relax();
-			}
 			if (!ctx->stop)
 				ne_recv_loc_release(&ctx->zc, 1u);
 			continue;
 		}
-
-		cpu_relax();
 	}
 	return NULL;
 }
