@@ -20,15 +20,6 @@ int bpf_xdp_attach(int ifindex, int prog_fd, __u32 flags,
 int bpf_xdp_detach(int ifindex, __u32 flags,
 		   const struct bpf_xdp_attach_opts *opts);
 
-static inline void cpu_relax(void)
-{
-#if defined(__x86_64__) || defined(__i386__)
-	__builtin_ia32_pause();
-#else
-	__asm__ volatile("" ::: "memory");
-#endif
-}
-
 static int ne_xskmap_bind(struct xsk_socket *xsk, int map_fd)
 {
 	int key = 0;
@@ -37,55 +28,6 @@ static int ne_xskmap_bind(struct xsk_socket *xsk, int map_fd)
 	if (xsk_socket__update_xskmap(xsk, map_fd) == 0)
 		return 0;
 	return bpf_map_update_elem(map_fd, &key, &xfd, BPF_ANY);
-}
-
-int ne_ring_init(struct ne_ring *r, uint32_t cap)
-{
-	memset(r, 0, sizeof(*r));
-	r->buf = calloc(cap, sizeof(struct ne_job));
-	r->cap = cap;
-	r->mask = cap - 1;
-	return 0;
-}
-
-void ne_ring_destroy(struct ne_ring *r)
-{
-	free(r->buf);
-	r->buf = NULL;
-}
-
-int ne_ring_try_push(struct ne_ring *r, const struct ne_job *j)
-{
-	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
-	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
-
-	if ((uint32_t)(head - tail) >= r->cap)
-		return -1;
-	memcpy(&r->buf[head & r->mask], j, sizeof(struct ne_job));
-	__atomic_thread_fence(__ATOMIC_RELEASE);
-	__atomic_store_n(&r->head, head + 1, __ATOMIC_RELEASE);
-	return 0;
-}
-
-int ne_ring_try_pop(struct ne_ring *r, struct ne_job *j)
-{
-	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
-	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
-
-	if (tail == head)
-		return -1;
-	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	memcpy(j, &r->buf[tail & r->mask], sizeof(struct ne_job));
-	__atomic_store_n(&r->tail, tail + 1, __ATOMIC_RELEASE);
-	return 0;
-}
-
-uint32_t ne_ring_count(const struct ne_ring *r)
-{
-	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
-	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
-
-	return head - tail;
 }
 
 int ne_addr_ring_init(struct ne_addr_ring *r, uint32_t cap)
@@ -349,64 +291,6 @@ int ne_tx_one_loc(struct ne_pair *p, uint64_t addr, uint32_t len)
 int ne_tx_one_wan(struct ne_pair *p, uint64_t addr, uint32_t len)
 {
 	return ne_tx_one_port(&p->wan, addr, len, p->frame_size);
-}
-
-static int ne_tx_drain_port(struct ne_zc_port *port, struct ne_ring *src,
-			      uint32_t max_frame)
-{
-	struct ne_job j;
-	uint32_t idx;
-	int xfd = xsk_socket__fd(port->xsk);
-	int n = 0;
-
-	for (;;) {
-		if (xsk_prod_nb_free(&port->tx, 1) < 1) {
-			if (ne_ring_count(src) &&
-			    xsk_ring_prod__needs_wakeup(&port->tx))
-				(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL,
-					     0);
-			break;
-		}
-		if (ne_ring_try_pop(src, &j) != 0) {
-			if (ne_ring_count(src) &&
-			    xsk_ring_prod__needs_wakeup(&port->tx))
-				(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL,
-					     0);
-			break;
-		}
-		if (xsk_ring_prod__reserve(&port->tx, 1, &idx) != 1) {
-			while (ne_ring_try_push(src, &j) != 0)
-				cpu_relax();
-			if (xsk_ring_prod__needs_wakeup(&port->tx))
-				(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL,
-					     0);
-			break;
-		}
-		{
-			struct xdp_desc *d =
-				xsk_ring_prod__tx_desc(&port->tx, idx);
-			uint32_t len = j.len;
-
-			if (len > max_frame)
-				len = max_frame;
-			d->addr = j.umem_addr;
-			d->len = len;
-		}
-		xsk_ring_prod__submit(&port->tx, 1);
-		(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
-		n++;
-	}
-	return n;
-}
-
-int ne_tx_drain_loc(struct ne_pair *p, struct ne_ring *src)
-{
-	return ne_tx_drain_port(&p->loc, src, p->frame_size);
-}
-
-int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src)
-{
-	return ne_tx_drain_port(&p->wan, src, p->frame_size);
 }
 
 static void ne_drain_cq_port(struct ne_zc_port *port,

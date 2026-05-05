@@ -8,31 +8,14 @@
 
 struct bpf_object;
 
-#define NE_RING       4096u
 #define NE_FRAME      2048u
 #define NE_N_FRAMES   8192u
 #define NE_FQ_INIT    2048u
 #define NE_CPU_LOC    0u
-#define NE_CPU_MID    0u
-#define NE_CPU_WAN    0u
 
 enum ne_dir {
 	NE_DIR_TO_WAN = 0,
 	NE_DIR_TO_LOC = 1,
-};
-
-struct ne_job {
-	uint64_t umem_addr;
-	uint32_t len;
-	uint32_t _pad;
-};
-
-struct ne_ring {
-	struct ne_job *buf;
-	uint32_t cap;
-	uint32_t mask;
-	__attribute__((aligned(64))) volatile uint32_t head;
-	__attribute__((aligned(64))) volatile uint32_t tail;
 };
 
 struct ne_addr_ring {
@@ -68,12 +51,6 @@ struct ne_pair {
 	uint8_t xdp_wan_on;
 };
 
-int ne_ring_init(struct ne_ring *r, uint32_t cap);
-void ne_ring_destroy(struct ne_ring *r);
-int ne_ring_try_pop(struct ne_ring *r, struct ne_job *j);
-int ne_ring_try_push(struct ne_ring *r, const struct ne_job *j);
-uint32_t ne_ring_count(const struct ne_ring *r);
-
 int ne_addr_ring_init(struct ne_addr_ring *r, uint32_t cap);
 void ne_addr_ring_destroy(struct ne_addr_ring *r);
 uint32_t ne_addr_ring_push(struct ne_addr_ring *r, const uint64_t *addrs,
@@ -91,8 +68,6 @@ void ne_recv_loc_release(struct ne_pair *p, unsigned int n);
 void ne_recv_wan_release(struct ne_pair *p, unsigned int n);
 int ne_tx_one_loc(struct ne_pair *p, uint64_t addr, uint32_t len);
 int ne_tx_one_wan(struct ne_pair *p, uint64_t addr, uint32_t len);
-int ne_tx_drain_loc(struct ne_pair *p, struct ne_ring *src);
-int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src);
 void ne_drain_cq_loc(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);
 void ne_refill_fq_loc(struct ne_pair *p);
@@ -103,11 +78,7 @@ void *ne_ptr(struct ne_pair *p, uint64_t addr);
 struct ne_ctx {
 	volatile sig_atomic_t stop;
 	struct ne_pair zc;
-	struct ne_ring ing_to_mid;
-	struct ne_ring wan_to_mid;
-	struct ne_ring w_to_wan;
-	struct ne_ring w_to_loc;
-	pthread_t th_pipe;
+	pthread_t th;
 };
 
 int ne_run(struct ne_ctx *ctx, const char *loc_if, const char *wan_if,
