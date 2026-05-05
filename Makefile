@@ -6,8 +6,8 @@ BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -Wall -Werror -Wno-unus
 CFLAGS := -O2 -g -Wall -Wextra -I./inc -D_GNU_SOURCE $(EXTRA_CFLAGS)
 LDFLAGS := -lxdp -lbpf -lelf -lz -lpthread
 
-OBJS := main.o src/interface.o src/threads.o
-BPF_OBJS := bpf/xdp_local.o bpf/xdp_wan.o
+OBJS := main.o src/interface.o
+BPF_OBJS := bpf/xdp.o
 
 .PHONY: all clean
 
@@ -23,14 +23,7 @@ src/interface.o: src/interface.c inc/ne.h
 	@mkdir -p src
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/threads.o: src/threads.c inc/ne.h inc/mac.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-bpf/xdp_local.o: bpf/xdp_local.c
-	@mkdir -p bpf
-	$(BPF_CLANG) $(BPF_CFLAGS) -c -o $@ $<
-
-bpf/xdp_wan.o: bpf/xdp_wan.c
+bpf/xdp.o: bpf/xdp.c
 	@mkdir -p bpf
 	$(BPF_CLANG) $(BPF_CFLAGS) -c -o $@ $<
 

@@ -19,7 +19,30 @@ int bpf_xdp_attach(int ifindex, int prog_fd, __u32 flags,
 int bpf_xdp_detach(int ifindex, __u32 flags,
 		   const struct bpf_xdp_attach_opts *opts);
 
-static int ne_xskmap_bind(struct xsk_socket *xsk, int map_fd)
+static void pool_push1(struct ne_pair *p, uint64_t a)
+{
+	uint32_t head = __atomic_load_n(&p->pool_head, __ATOMIC_RELAXED);
+	uint32_t tail = __atomic_load_n(&p->pool_tail, __ATOMIC_ACQUIRE);
+
+	if ((uint32_t)(head - tail) >= p->pool_cap)
+		return;
+	p->pool_buf[head & p->pool_mask] = a;
+	__atomic_store_n(&p->pool_head, head + 1, __ATOMIC_RELEASE);
+}
+
+static int pool_pop1(struct ne_pair *p, uint64_t *a)
+{
+	uint32_t tail = __atomic_load_n(&p->pool_tail, __ATOMIC_RELAXED);
+	uint32_t head = __atomic_load_n(&p->pool_head, __ATOMIC_ACQUIRE);
+
+	if (tail == head)
+		return -1;
+	*a = p->pool_buf[tail & p->pool_mask];
+	__atomic_store_n(&p->pool_tail, tail + 1, __ATOMIC_RELEASE);
+	return 0;
+}
+
+static int xskmap_bind(struct xsk_socket *xsk, int map_fd)
 {
 	int key = 0;
 	int xfd = xsk_socket__fd(xsk);
@@ -29,60 +52,13 @@ static int ne_xskmap_bind(struct xsk_socket *xsk, int map_fd)
 	return bpf_map_update_elem(map_fd, &key, &xfd, BPF_ANY);
 }
 
-int ne_addr_ring_init(struct ne_addr_ring *r, uint32_t cap)
-{
-	memset(r, 0, sizeof(*r));
-	r->buf = calloc(cap, sizeof(uint64_t));
-	r->cap = cap;
-	r->mask = cap - 1;
-	return 0;
-}
-
-void ne_addr_ring_destroy(struct ne_addr_ring *r)
-{
-	free(r->buf);
-	r->buf = NULL;
-}
-
-uint32_t ne_addr_ring_push(struct ne_addr_ring *r, const uint64_t *addrs,
-			    uint32_t n)
-{
-	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
-	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
-	uint32_t free_slots = r->cap - (head - tail);
-	uint32_t i;
-
-	if (n > free_slots)
-		n = free_slots;
-	for (i = 0; i < n; i++)
-		r->buf[(head + i) & r->mask] = addrs[i];
-	__atomic_store_n(&r->head, head + n, __ATOMIC_RELEASE);
-	return n;
-}
-
-uint32_t ne_addr_ring_pop(struct ne_addr_ring *r, uint64_t *addrs,
-			   uint32_t n)
-{
-	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
-	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
-	uint32_t avail = head - tail;
-	uint32_t i;
-
-	if (n > avail)
-		n = avail;
-	for (i = 0; i < n; i++)
-		addrs[i] = r->buf[(tail + i) & r->mask];
-	__atomic_store_n(&r->tail, tail + n, __ATOMIC_RELEASE);
-	return n;
-}
-
-void *ne_ptr(struct ne_pair *p, uint64_t addr)
+void *ne_umem_ptr(struct ne_pair *p, uint64_t addr)
 {
 	return xsk_umem__get_data(p->bufs, addr);
 }
 
-static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
-			 const char *ifn)
+static int sock_open(struct ne_pair *p, struct ne_zc_port *port,
+		     const char *ifn)
 {
 	struct xsk_socket_config cfg = {
 		.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
@@ -97,179 +73,28 @@ static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
 					 &port->fq, &port->cq, &cfg);
 }
 
-int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
-		  const char *bpf_loc_o, const char *bpf_wan_o)
+static void fq_fill(struct ne_pair *p, struct ne_zc_port *port)
 {
-#define NE_TRY(expr) do { if (expr) goto fail; } while (0)
-	struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
-	struct xsk_umem_config ucfg = {
-		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS * 2,
-		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
-		.frame_size = NE_FRAME,
-		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
-		.flags = 0,
-	};
-	struct bpf_program *pl;
-	struct bpf_program *pw;
-	struct bpf_map *ml;
-	uint32_t half = NE_N_FRAMES / 2;
-	uint32_t i, pi, idx, per_fq, want;
 	uint64_t a;
+	uint32_t idx;
 
-	memset(p, 0, sizeof(*p));
-	p->frame_size = NE_FRAME;
-	p->n_frames = NE_N_FRAMES;
-	p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
-	setrlimit(RLIMIT_MEMLOCK, &rl);
-	p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
-		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (p->bufs == MAP_FAILED)
-		return -1;
-	NE_TRY(ne_addr_ring_init(&p->pool_loc, half));
-	NE_TRY(ne_addr_ring_init(&p->pool_wan, half));
-	for (i = 0; i < half; i++) {
-		uint64_t a = (uint64_t)i * p->frame_size;
-
-		ne_addr_ring_push(&p->pool_loc, &a, 1);
-	}
-	for (i = half; i < p->n_frames; i++) {
-		uint64_t a = (uint64_t)i * p->frame_size;
-
-		ne_addr_ring_push(&p->pool_wan, &a, 1);
-	}
-	NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->loc.fq,
-				&p->loc.cq, &ucfg));
-	NE_TRY(ne_sock_open(p, &p->loc, loc_if));
-	p->loc.ifindex = if_nametoindex(loc_if);
-	NE_TRY(!p->loc.ifindex);
-	NE_TRY(ne_sock_open(p, &p->wan, wan_if));
-	p->wan.ifindex = if_nametoindex(wan_if);
-	NE_TRY(!p->wan.ifindex);
-	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
-	for (pi = 0; pi < 2; pi++) {
-		struct ne_zc_port *port = pi ? &p->wan : &p->loc;
-		struct ne_addr_ring *pool = pi ? &p->pool_wan : &p->pool_loc;
-
-		for (want = per_fq; want > 0; want--) {
-			if (ne_addr_ring_pop(pool, &a, 1) != 1)
-				break;
-			if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
-				(void)ne_addr_ring_push(pool, &a, 1);
-				break;
-			}
-			*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
-			xsk_ring_prod__submit(&port->fq, 1);
+	for (;;) {
+		if (xsk_prod_nb_free(&port->fq, 1) < 1)
+			break;
+		if (pool_pop1(p, &a) != 0)
+			break;
+		if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
+			pool_push1(p, a);
+			break;
 		}
+		*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
+		xsk_ring_prod__submit(&port->fq, 1);
 	}
-	p->bpf_loc = bpf_object__open_file(bpf_loc_o, NULL);
-	p->bpf_wan = bpf_object__open_file(bpf_wan_o, NULL);
-	NE_TRY(!p->bpf_loc || !p->bpf_wan);
-	NE_TRY(bpf_object__load(p->bpf_loc));
-	NE_TRY(bpf_object__load(p->bpf_wan));
-	pl = bpf_object__find_program_by_name(p->bpf_loc, "xdp_redirect_prog");
-	pw = bpf_object__find_program_by_name(p->bpf_wan, "xdp_wan_pass_prog");
-	NE_TRY(!pl || !pw);
-	NE_TRY(bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
-			      XDP_FLAGS_DRV_MODE, NULL));
-	p->xdp_loc_on = 1;
-	NE_TRY(bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
-			      XDP_FLAGS_DRV_MODE, NULL));
-	p->xdp_wan_on = 1;
-	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
-	NE_TRY(!ml);
-	NE_TRY(ne_xskmap_bind(p->loc.xsk, bpf_map__fd(ml)));
-#undef NE_TRY
-	return 0;
-fail:
-	ne_pair_close(p);
-#undef NE_TRY
-	return -1;
 }
 
-void ne_pair_close(struct ne_pair *p)
+static void cq_drain_out(struct ne_pair *p)
 {
-	if (p->xdp_wan_on)
-		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
-	if (p->xdp_loc_on)
-		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
-	p->xdp_wan_on = 0;
-	p->xdp_loc_on = 0;
-	if (p->bpf_wan)
-		bpf_object__close(p->bpf_wan);
-	if (p->bpf_loc)
-		bpf_object__close(p->bpf_loc);
-	p->bpf_wan = NULL;
-	p->bpf_loc = NULL;
-	if (p->wan.xsk)
-		xsk_socket__delete(p->wan.xsk);
-	if (p->loc.xsk)
-		xsk_socket__delete(p->loc.xsk);
-	p->wan.xsk = NULL;
-	p->loc.xsk = NULL;
-	if (p->umem)
-		xsk_umem__delete(p->umem);
-	p->umem = NULL;
-	ne_addr_ring_destroy(&p->pool_loc);
-	ne_addr_ring_destroy(&p->pool_wan);
-	if (p->bufs)
-		munmap(p->bufs, p->bufsize);
-	p->bufs = NULL;
-}
-
-static int ne_recv_port(struct ne_zc_port *port, uint32_t *lens,
-			 uint64_t *addrs, int max)
-{
-	uint32_t idx;
-	unsigned int n;
-	unsigned int i;
-
-	n = xsk_ring_cons__peek(&port->rx, (uint32_t)max, &idx);
-	for (i = 0; i < n; i++) {
-		const struct xdp_desc *d =
-			xsk_ring_cons__rx_desc(&port->rx, idx + i);
-
-		addrs[i] = d->addr;
-		lens[i] = d->len;
-	}
-	return (int)n;
-}
-
-int ne_recv_loc(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
-{
-	return ne_recv_port(&p->loc, lens, addrs, max);
-}
-
-void ne_recv_loc_release(struct ne_pair *p, unsigned int n)
-{
-	if (n)
-		xsk_ring_cons__release(&p->loc.rx, n);
-}
-
-static int ne_tx_one_port(struct ne_zc_port *port, uint64_t addr, uint32_t len,
-			  uint32_t max_frame)
-{
-	uint32_t idx;
-	struct xdp_desc *d;
-
-	if (len > max_frame)
-		len = max_frame;
-	if (xsk_ring_prod__reserve(&port->tx, 1, &idx) != 1)
-		return -1;
-	d = xsk_ring_prod__tx_desc(&port->tx, idx);
-	d->addr = addr;
-	d->len = len;
-	xsk_ring_prod__submit(&port->tx, 1);
-	return 0;
-}
-
-int ne_tx_one_wan(struct ne_pair *p, uint64_t addr, uint32_t len)
-{
-	return ne_tx_one_port(&p->wan, addr, len, p->frame_size);
-}
-
-static void ne_drain_cq_port(struct ne_zc_port *port,
-			      struct ne_addr_ring *target_pool)
-{
+	struct ne_zc_port *port = &p->out;
 	uint32_t idx;
 	uint32_t n;
 	uint64_t a;
@@ -280,41 +105,157 @@ static void ne_drain_cq_port(struct ne_zc_port *port,
 			break;
 		a = *xsk_ring_cons__comp_addr(&port->cq, idx);
 		xsk_ring_cons__release(&port->cq, 1);
-		(void)ne_addr_ring_push(target_pool, &a, 1);
+		pool_push1(p, a);
 	}
 }
 
-void ne_drain_cq_wan(struct ne_pair *p)
+void ne_maintain(struct ne_pair *p)
 {
-	ne_drain_cq_port(&p->wan, &p->pool_loc);
+	cq_drain_out(p);
+	fq_fill(p, &p->in);
+	fq_fill(p, &p->out);
 }
 
-static void ne_refill_fq_port(struct ne_zc_port *port,
-			       struct ne_addr_ring *source_pool)
+int ne_open(struct ne_pair *p, const char *if_in, const char *if_out,
+	    const char *bpf_o)
 {
+#define NE_TRY(x) do { if (x) goto fail; } while (0)
+	struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
+	struct xsk_umem_config ucfg = {
+		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS * 2,
+		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+		.frame_size = NE_FRAME,
+		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+		.flags = 0,
+	};
+	struct bpf_program *pin, *pout;
+	struct bpf_map *map;
+	uint32_t i, pi, idx, per_fq, want;
 	uint64_t a;
-	uint32_t idx;
 
-	for (;;) {
-		if (xsk_prod_nb_free(&port->fq, 1) < 1)
-			break;
-		if (ne_addr_ring_pop(source_pool, &a, 1) != 1)
-			break;
-		if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
-			(void)ne_addr_ring_push(source_pool, &a, 1);
-			break;
+	memset(p, 0, sizeof(*p));
+	p->frame_size = NE_FRAME;
+	p->n_frames = NE_N_FRAMES;
+	p->bufsize = (size_t)p->n_frames * (size_t)p->frame_size;
+	p->pool_cap = p->n_frames;
+	p->pool_mask = p->n_frames - 1;
+	setrlimit(RLIMIT_MEMLOCK, &rl);
+	p->pool_buf = calloc(p->pool_cap, sizeof(uint64_t));
+	NE_TRY(!p->pool_buf);
+	p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	NE_TRY(p->bufs == MAP_FAILED);
+	for (i = 0; i < p->n_frames; i++)
+		pool_push1(p, (uint64_t)i * p->frame_size);
+	NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->in.fq,
+				&p->in.cq, &ucfg));
+	NE_TRY(sock_open(p, &p->in, if_in));
+	p->in.ifindex = if_nametoindex(if_in);
+	NE_TRY(!p->in.ifindex);
+	NE_TRY(sock_open(p, &p->out, if_out));
+	p->out.ifindex = if_nametoindex(if_out);
+	NE_TRY(!p->out.ifindex);
+	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
+	for (pi = 0; pi < 2; pi++) {
+		struct ne_zc_port *port = pi ? &p->out : &p->in;
+
+		for (want = per_fq; want > 0; want--) {
+			if (pool_pop1(p, &a) != 0)
+				break;
+			if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
+				pool_push1(p, a);
+				break;
+			}
+			*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
+			xsk_ring_prod__submit(&port->fq, 1);
 		}
-		*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
-		xsk_ring_prod__submit(&port->fq, 1);
 	}
+	p->bpf = bpf_object__open_file(bpf_o, NULL);
+	NE_TRY(!p->bpf);
+	NE_TRY(bpf_object__load(p->bpf));
+	pin = bpf_object__find_program_by_name(p->bpf, "xdp_redirect_prog");
+	pout = bpf_object__find_program_by_name(p->bpf, "xdp_wan_pass_prog");
+	NE_TRY(!pin || !pout);
+	NE_TRY(bpf_xdp_attach(p->in.ifindex, bpf_program__fd(pin),
+			      XDP_FLAGS_DRV_MODE, NULL));
+	p->xdp_in_on = 1;
+	NE_TRY(bpf_xdp_attach(p->out.ifindex, bpf_program__fd(pout),
+			      XDP_FLAGS_DRV_MODE, NULL));
+	p->xdp_out_on = 1;
+	map = bpf_object__find_map_by_name(p->bpf, "xsks_map");
+	NE_TRY(!map);
+	NE_TRY(xskmap_bind(p->in.xsk, bpf_map__fd(map)));
+#undef NE_TRY
+	return 0;
+fail:
+	ne_close(p);
+	return -1;
 }
 
-void ne_refill_fq_loc(struct ne_pair *p)
+void ne_close(struct ne_pair *p)
 {
-	ne_refill_fq_port(&p->loc, &p->pool_loc);
+	if (p->xdp_out_on)
+		bpf_xdp_detach(p->out.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+	if (p->xdp_in_on)
+		bpf_xdp_detach(p->in.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+	p->xdp_out_on = 0;
+	p->xdp_in_on = 0;
+	if (p->bpf)
+		bpf_object__close(p->bpf);
+	p->bpf = NULL;
+	if (p->out.xsk)
+		xsk_socket__delete(p->out.xsk);
+	if (p->in.xsk)
+		xsk_socket__delete(p->in.xsk);
+	p->out.xsk = NULL;
+	p->in.xsk = NULL;
+	if (p->umem)
+		xsk_umem__delete(p->umem);
+	p->umem = NULL;
+	free(p->pool_buf);
+	p->pool_buf = NULL;
+	if (p->bufs)
+		munmap(p->bufs, p->bufsize);
+	p->bufs = NULL;
 }
 
-void ne_refill_fq_wan(struct ne_pair *p)
+int ne_rx_peek(struct ne_pair *p, uint32_t *len, uint64_t *addr)
 {
-	ne_refill_fq_port(&p->wan, &p->pool_wan);
+	struct xsk_ring_cons *rx = &p->in.rx;
+	uint32_t idx;
+	unsigned int n;
+
+	n = xsk_ring_cons__peek(rx, 1, &idx);
+	if (!n)
+		return 0;
+	{
+		const struct xdp_desc *d = xsk_ring_cons__rx_desc(rx, idx);
+
+		*addr = d->addr;
+		*len = d->len;
+	}
+	return 1;
+}
+
+void ne_rx_release(struct ne_pair *p, unsigned int n)
+{
+	if (n)
+		xsk_ring_cons__release(&p->in.rx, n);
+}
+
+int ne_tx_out(struct ne_pair *p, uint64_t addr, uint32_t len)
+{
+	struct xsk_ring_prod *tx = &p->out.tx;
+	uint32_t idx;
+	struct xdp_desc *d;
+
+	if (len > p->frame_size)
+		len = p->frame_size;
+	if (xsk_ring_prod__reserve(tx, 1, &idx) != 1)
+		return -1;
+	d = xsk_ring_prod__tx_desc(tx, idx);
+	d->addr = addr;
+	d->len = len;
+	xsk_ring_prod__submit(tx, 1);
+	return 0;
 }

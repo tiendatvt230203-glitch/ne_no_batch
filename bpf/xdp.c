@@ -42,4 +42,11 @@ int xdp_redirect_prog(struct xdp_md *ctx)
 	return bpf_redirect_map(&xsks_map, 0, 0);
 }
 
+SEC("xdp")
+int xdp_wan_pass_prog(struct xdp_md *ctx)
+{
+	(void)ctx;
+	return XDP_PASS;
+}
+
 char _license[] SEC("license") = "GPL";
