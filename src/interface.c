@@ -112,7 +112,6 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	struct bpf_program *pl;
 	struct bpf_program *pw;
 	struct bpf_map *ml;
-	struct bpf_map *mw;
 	uint32_t half = NE_N_FRAMES / 2;
 	uint32_t i, pi, idx, per_fq, want;
 	uint64_t a;
@@ -168,8 +167,7 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	NE_TRY(bpf_object__load(p->bpf_loc));
 	NE_TRY(bpf_object__load(p->bpf_wan));
 	pl = bpf_object__find_program_by_name(p->bpf_loc, "xdp_redirect_prog");
-	pw = bpf_object__find_program_by_name(p->bpf_wan,
-					      "xdp_wan_redirect_prog");
+	pw = bpf_object__find_program_by_name(p->bpf_wan, "xdp_wan_pass_prog");
 	NE_TRY(!pl || !pw);
 	NE_TRY(bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
 			      XDP_FLAGS_DRV_MODE, NULL));
@@ -178,10 +176,8 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 			      XDP_FLAGS_DRV_MODE, NULL));
 	p->xdp_wan_on = 1;
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
-	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
-	NE_TRY(!ml || !mw);
+	NE_TRY(!ml);
 	NE_TRY(ne_xskmap_bind(p->loc.xsk, bpf_map__fd(ml)));
-	NE_TRY(ne_xskmap_bind(p->wan.xsk, bpf_map__fd(mw)));
 #undef NE_TRY
 	return 0;
 fail:
@@ -243,21 +239,10 @@ int ne_recv_loc(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 	return ne_recv_port(&p->loc, lens, addrs, max);
 }
 
-int ne_recv_wan(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
-{
-	return ne_recv_port(&p->wan, lens, addrs, max);
-}
-
 void ne_recv_loc_release(struct ne_pair *p, unsigned int n)
 {
 	if (n)
 		xsk_ring_cons__release(&p->loc.rx, n);
-}
-
-void ne_recv_wan_release(struct ne_pair *p, unsigned int n)
-{
-	if (n)
-		xsk_ring_cons__release(&p->wan.rx, n);
 }
 
 static int ne_tx_one_port(struct ne_zc_port *port, uint64_t addr, uint32_t len,
@@ -275,11 +260,6 @@ static int ne_tx_one_port(struct ne_zc_port *port, uint64_t addr, uint32_t len,
 	d->len = len;
 	xsk_ring_prod__submit(&port->tx, 1);
 	return 0;
-}
-
-int ne_tx_one_loc(struct ne_pair *p, uint64_t addr, uint32_t len)
-{
-	return ne_tx_one_port(&p->loc, addr, len, p->frame_size);
 }
 
 int ne_tx_one_wan(struct ne_pair *p, uint64_t addr, uint32_t len)

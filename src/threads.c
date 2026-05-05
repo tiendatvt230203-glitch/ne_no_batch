@@ -17,21 +17,14 @@ static void setaffinity(unsigned int cpu)
 	pthread_setaffinity_np(pthread_self(), sizeof(s), &s);
 }
 
-static void rewrite_eth(struct ne_pair *zc, uint64_t addr, enum ne_dir d)
+static void rewrite_eth_to_wan(struct ne_pair *zc, uint64_t addr)
 {
 	uint8_t *pkt = ne_ptr(zc, addr);
 	static const uint8_t wan_dst[] = { MAC_WAN_DST };
 	static const uint8_t wan_src[] = { MAC_WAN_SRC };
-	static const uint8_t loc_dst[] = { MAC_LOC_DST };
-	static const uint8_t loc_src[] = { MAC_LOC_SRC };
 
-	if (d == NE_DIR_TO_WAN) {
-		memcpy(pkt, wan_dst, ETH_ALEN);
-		memcpy(pkt + ETH_ALEN, wan_src, ETH_ALEN);
-	} else {
-		memcpy(pkt, loc_dst, ETH_ALEN);
-		memcpy(pkt + ETH_ALEN, loc_src, ETH_ALEN);
-	}
+	memcpy(pkt, wan_dst, ETH_ALEN);
+	memcpy(pkt + ETH_ALEN, wan_src, ETH_ALEN);
 }
 
 static void ne_maintain(struct ne_ctx *ctx)
@@ -48,7 +41,7 @@ static void *worker(void *arg)
 	uint32_t len;
 	uint64_t addr;
 
-	setaffinity(NE_CPU_LOC);
+	setaffinity(NE_CPU);
 	for (;;) {
 		if (ctx->stop)
 			break;
@@ -60,21 +53,11 @@ static void *worker(void *arg)
 
 			do {
 				progress = 0;
-				if (ne_recv_wan(&ctx->zc, &len, &addr, 1) > 0) {
-					rewrite_eth(&ctx->zc, addr, NE_DIR_TO_LOC);
-					while (!ctx->stop &&
-					       ne_tx_one_loc(&ctx->zc, addr, len) != 0)
-						ne_maintain(ctx);
-					if (!ctx->stop)
-						ne_recv_wan_release(&ctx->zc, 1u);
-					progress = 1;
-				}
-				if (ctx->stop)
-					break;
 				if (ne_recv_loc(&ctx->zc, &len, &addr, 1) > 0) {
-					rewrite_eth(&ctx->zc, addr, NE_DIR_TO_WAN);
+					rewrite_eth_to_wan(&ctx->zc, addr);
 					while (!ctx->stop &&
-					       ne_tx_one_wan(&ctx->zc, addr, len) != 0)
+					       ne_tx_one_wan(&ctx->zc, addr,
+							     len) != 0)
 						ne_maintain(ctx);
 					if (!ctx->stop)
 						ne_recv_loc_release(&ctx->zc, 1u);

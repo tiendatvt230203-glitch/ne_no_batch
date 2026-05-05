@@ -11,12 +11,7 @@ struct bpf_object;
 #define NE_FRAME      2048u
 #define NE_N_FRAMES   8192u
 #define NE_FQ_INIT    2048u
-#define NE_CPU_LOC    0u
-
-enum ne_dir {
-	NE_DIR_TO_WAN = 0,
-	NE_DIR_TO_LOC = 1,
-};
+#define NE_CPU        0u
 
 struct ne_addr_ring {
 	uint64_t *buf;
@@ -63,10 +58,7 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 void ne_pair_close(struct ne_pair *p);
 
 int ne_recv_loc(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max);
-int ne_recv_wan(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max);
 void ne_recv_loc_release(struct ne_pair *p, unsigned int n);
-void ne_recv_wan_release(struct ne_pair *p, unsigned int n);
-int ne_tx_one_loc(struct ne_pair *p, uint64_t addr, uint32_t len);
 int ne_tx_one_wan(struct ne_pair *p, uint64_t addr, uint32_t len);
 void ne_drain_cq_loc(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);
