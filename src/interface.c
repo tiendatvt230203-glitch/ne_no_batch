@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <bpf/bpf.h>
@@ -311,6 +312,7 @@ static int ne_tx_drain_port(struct ne_zc_port *port, struct ne_ring *src,
 {
 	struct ne_job j;
 	uint32_t idx;
+	int xfd = xsk_socket__fd(port->xsk);
 	int sent = 0;
 
 	for (;;) {
@@ -329,6 +331,8 @@ static int ne_tx_drain_port(struct ne_zc_port *port, struct ne_ring *src,
 		d->addr = j.umem_addr;
 		d->len = j.len > max_frame ? max_frame : j.len;
 		xsk_ring_prod__submit(&port->tx, 1);
+		if (xsk_ring_prod__needs_wakeup(&port->tx))
+			(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 		sent++;
 	}
 	return sent;
