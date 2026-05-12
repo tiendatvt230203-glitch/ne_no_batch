@@ -20,6 +20,7 @@ static void *loc_worker(void *arg)
 	uint32_t len;
 	uint64_t addr;
 	struct ne_job j;
+	unsigned int rr = 0;
 
 	setaffinity(NE_CPU_LOC);
 	for (;;) {
@@ -30,27 +31,57 @@ static void *loc_worker(void *arg)
 		ne_refill_fq_loc(&ctx->zc);
 		ne_refill_fq_loc2(&ctx->zc);
 		(void)ne_tx_drain_loc(&ctx->zc, &ctx->w_to_loc);
-		if (ne_recv_loc(&ctx->zc, &len, &addr, 1) > 0) {
-			memset(&j, 0, sizeof(j));
-			j.umem_addr = addr;
-			j.len = len;
-			j.rx_ifidx = (uint32_t)ctx->zc.loc.ifindex;
-			while (!ctx->stop &&
-			       ne_ring_try_push(&ctx->ing_to_mid, &j) != 0)
-				(void)ne_tx_drain_loc(&ctx->zc, &ctx->w_to_loc);
-			if (!ctx->stop)
-				ne_recv_loc_release(&ctx->zc, 1u);
-		}
-		if (ne_recv_loc2(&ctx->zc, &len, &addr, 1) > 0) {
-			memset(&j, 0, sizeof(j));
-			j.umem_addr = addr;
-			j.len = len;
-			j.rx_ifidx = (uint32_t)ctx->zc.loc2.ifindex;
-			while (!ctx->stop &&
-			       ne_ring_try_push(&ctx->ing_to_mid, &j) != 0)
-				(void)ne_tx_drain_loc(&ctx->zc, &ctx->w_to_loc);
-			if (!ctx->stop)
-				ne_recv_loc2_release(&ctx->zc, 1u);
+		rr++;
+		if (rr & 1u) {
+			if (ne_recv_loc(&ctx->zc, &len, &addr, 1) > 0) {
+				memset(&j, 0, sizeof(j));
+				j.umem_addr = addr;
+				j.len = len;
+				j.rx_ifidx = (uint32_t)ctx->zc.loc.ifindex;
+				while (!ctx->stop &&
+				       ne_ring_try_push(&ctx->ing_to_mid, &j) != 0)
+					(void)ne_tx_drain_loc(&ctx->zc,
+							      &ctx->w_to_loc);
+				if (!ctx->stop)
+					ne_recv_loc_release(&ctx->zc, 1u);
+			}
+			if (ne_recv_loc2(&ctx->zc, &len, &addr, 1) > 0) {
+				memset(&j, 0, sizeof(j));
+				j.umem_addr = addr;
+				j.len = len;
+				j.rx_ifidx = (uint32_t)ctx->zc.loc2.ifindex;
+				while (!ctx->stop &&
+				       ne_ring_try_push(&ctx->ing_to_mid, &j) != 0)
+					(void)ne_tx_drain_loc(&ctx->zc,
+							      &ctx->w_to_loc);
+				if (!ctx->stop)
+					ne_recv_loc2_release(&ctx->zc, 1u);
+			}
+		} else {
+			if (ne_recv_loc2(&ctx->zc, &len, &addr, 1) > 0) {
+				memset(&j, 0, sizeof(j));
+				j.umem_addr = addr;
+				j.len = len;
+				j.rx_ifidx = (uint32_t)ctx->zc.loc2.ifindex;
+				while (!ctx->stop &&
+				       ne_ring_try_push(&ctx->ing_to_mid, &j) != 0)
+					(void)ne_tx_drain_loc(&ctx->zc,
+							      &ctx->w_to_loc);
+				if (!ctx->stop)
+					ne_recv_loc2_release(&ctx->zc, 1u);
+			}
+			if (ne_recv_loc(&ctx->zc, &len, &addr, 1) > 0) {
+				memset(&j, 0, sizeof(j));
+				j.umem_addr = addr;
+				j.len = len;
+				j.rx_ifidx = (uint32_t)ctx->zc.loc.ifindex;
+				while (!ctx->stop &&
+				       ne_ring_try_push(&ctx->ing_to_mid, &j) != 0)
+					(void)ne_tx_drain_loc(&ctx->zc,
+							      &ctx->w_to_loc);
+				if (!ctx->stop)
+					ne_recv_loc_release(&ctx->zc, 1u);
+			}
 		}
 	}
 	return NULL;

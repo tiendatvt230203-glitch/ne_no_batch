@@ -12,6 +12,7 @@ struct bpf_object;
 #define NE_FRAME      2048u
 #define NE_N_FRAMES   8192u
 #define NE_FQ_INIT    2048u
+#define NE_WAN_Q_MAX  64u
 #define NE_CPU_LOC    0u
 #define NE_CPU_MID    3u
 #define NE_CPU_WAN    11u
@@ -61,7 +62,9 @@ struct ne_pair {
 	struct xsk_umem *umem;
 	struct ne_zc_port loc;
 	struct ne_zc_port loc2;
-	struct ne_zc_port wan;
+	struct ne_zc_port *wan;
+	uint32_t wan_nq;
+	uint32_t wan_rx_q;
 	struct ne_pool pool;
 	struct bpf_object *bpf_loc;
 	struct bpf_object *bpf_wan;

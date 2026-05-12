@@ -3,6 +3,7 @@
 #include <linux/if_ether.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
+#include <dirent.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,13 +16,54 @@
 #include <bpf/libbpf.h>
 #include <xdp/xsk.h>
 
+static int ne_link_xdp_fd(int ifindex, int fd, __u32 flags)
+{
+	struct bpf_xdp_attach_opts opts = {
+		.sz = sizeof(opts),
+	};
+
+	return bpf_xdp_attach(ifindex, fd, flags, &opts);
+}
+
+static int ne_detach_xdp_fd(int ifindex, __u32 flags)
+{
+	struct bpf_xdp_attach_opts opts = {
+		.sz = sizeof(opts),
+	};
+
+	return bpf_xdp_detach(ifindex, flags, &opts);
+}
+
+#include <xdp/libxdp.h>
+
 #include "ne.h"
 
-struct bpf_xdp_attach_opts;
-int bpf_xdp_attach(int ifindex, int prog_fd, __u32 flags,
-		   const struct bpf_xdp_attach_opts *opts);
-int bpf_xdp_detach(int ifindex, __u32 flags,
-		   const struct bpf_xdp_attach_opts *opts);
+#undef bpf_xdp_attach
+#define bpf_xdp_attach(ifindex, fd, flags, opts) \
+	ne_link_xdp_fd(ifindex, fd, flags)
+
+#undef bpf_xdp_detach
+#define bpf_xdp_detach(ifindex, flags, opts) ne_detach_xdp_fd(ifindex, flags)
+
+static unsigned int ne_net_rx_queues(const char *ifname)
+{
+	char path[256];
+	DIR *dir;
+	struct dirent *de;
+	unsigned int n = 0;
+
+	snprintf(path, sizeof path, "/sys/class/net/%s/queues", ifname);
+	dir = opendir(path);
+	if (!dir)
+		return 1;
+	while ((de = readdir(dir)) != NULL) {
+		if (strncmp(de->d_name, "rx-", 3) != 0)
+			continue;
+		n++;
+	}
+	closedir(dir);
+	return n ? n : 1;
+}
 
 static int ne_if_hwaddr(const char *ifname, uint8_t *out)
 {
@@ -160,8 +202,8 @@ void *ne_ptr(struct ne_pair *p, uint64_t addr)
 	return xsk_umem__get_data(p->bufs, addr);
 }
 
-static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
-			const char *ifn)
+static int ne_sock_open_q(struct ne_pair *p, struct ne_zc_port *port,
+			  const char *ifn, uint32_t queue_id)
 {
 	struct xsk_socket_config cfg = {
 		.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
@@ -171,9 +213,15 @@ static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
 		.bind_flags = XDP_COPY,
 	};
 
-	return xsk_socket__create_shared(&port->xsk, ifn, 0, p->umem,
+	return xsk_socket__create_shared(&port->xsk, ifn, queue_id, p->umem,
 					 &port->rx, &port->tx,
 					 &port->fq, &port->cq, &cfg);
+}
+
+static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
+			const char *ifn)
+{
+	return ne_sock_open_q(p, port, ifn, 0);
 }
 
 int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
@@ -195,7 +243,8 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
 	struct bpf_map *mw;
 	struct bpf_map *mif;
 	uint64_t a;
-	uint32_t i, pi, idx, per_fq, want;
+	uint32_t i, pi, idx, per_fq, want, wq, wan_q;
+	unsigned int per_wq;
 	int fd_ml;
 	uint32_t k0 = 0, k1 = 1;
 
@@ -224,13 +273,20 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
 	NE_TRY(!p->loc2.ifindex);
 	p->loc2.hwaddr_valid =
 	    (uint8_t)(ne_if_hwaddr(loc2_if, p->loc2.hwaddr) == 0);
-	NE_TRY(ne_sock_open(p, &p->wan, wan_if));
-	p->wan.ifindex = if_nametoindex(wan_if);
-	NE_TRY(!p->wan.ifindex);
+	wan_q = ne_net_rx_queues(wan_if);
+	if (wan_q > NE_WAN_Q_MAX)
+		wan_q = NE_WAN_Q_MAX;
+	p->wan = calloc(wan_q, sizeof(struct ne_zc_port));
+	NE_TRY(!p->wan);
+	p->wan_nq = wan_q;
+	for (wq = 0; wq < p->wan_nq; wq++) {
+		NE_TRY(ne_sock_open_q(p, &p->wan[wq], wan_if, wq));
+		p->wan[wq].ifindex = if_nametoindex(wan_if);
+		NE_TRY(!p->wan[wq].ifindex);
+	}
 	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
-	for (pi = 0; pi < 3; pi++) {
-		struct ne_zc_port *port =
-		    pi == 0 ? &p->loc : (pi == 1 ? &p->loc2 : &p->wan);
+	for (pi = 0; pi < 2; pi++) {
+		struct ne_zc_port *port = pi == 0 ? &p->loc : &p->loc2;
 
 		for (want = per_fq; want > 0; want--) {
 			if (ne_pool_pop(&p->pool, &a, 1) != 1)
@@ -241,6 +297,22 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
 			}
 			*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
 			xsk_ring_prod__submit(&port->fq, 1);
+		}
+	}
+	per_wq = per_fq / p->wan_nq;
+	if (per_wq == 0)
+		per_wq = 1;
+	for (wq = 0; wq < p->wan_nq; wq++) {
+		for (want = per_wq; want > 0; want--) {
+			if (ne_pool_pop(&p->pool, &a, 1) != 1)
+				break;
+			if (xsk_ring_prod__reserve(&p->wan[wq].fq, 1, &idx) !=
+			    1) {
+				(void)ne_pool_push(&p->pool, &a, 1);
+				break;
+			}
+			*xsk_ring_prod__fill_addr(&p->wan[wq].fq, idx) = a;
+			xsk_ring_prod__submit(&p->wan[wq].fq, 1);
 		}
 	}
 	p->bpf_loc = bpf_object__open_file(bpf_loc_o, NULL);
@@ -257,7 +329,7 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
 	NE_TRY(bpf_xdp_attach(p->loc2.ifindex, bpf_program__fd(pl),
 			      XDP_FLAGS_DRV_MODE, NULL));
 	p->xdp_loc2_on = 1;
-	NE_TRY(bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
+	NE_TRY(bpf_xdp_attach(p->wan[0].ifindex, bpf_program__fd(pw),
 			      XDP_FLAGS_DRV_MODE, NULL));
 	p->xdp_wan_on = 1;
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
@@ -267,7 +339,8 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
 	fd_ml = bpf_map__fd(ml);
 	NE_TRY(ne_xskmap_bind(p->loc.xsk, fd_ml, 0));
 	NE_TRY(ne_xskmap_bind(p->loc2.xsk, fd_ml, 1));
-	NE_TRY(ne_xskmap_bind(p->wan.xsk, bpf_map__fd(mw), 0));
+	for (wq = 0; wq < p->wan_nq; wq++)
+		NE_TRY(ne_xskmap_bind(p->wan[wq].xsk, bpf_map__fd(mw), wq));
 	NE_TRY(bpf_map_update_elem(bpf_map__fd(mif), &p->loc.ifindex, &k0,
 				   BPF_ANY));
 	NE_TRY(bpf_map_update_elem(bpf_map__fd(mif), &p->loc2.ifindex, &k1,
@@ -281,8 +354,10 @@ fail:
 
 void ne_pair_close(struct ne_pair *p)
 {
-	if (p->xdp_wan_on)
-		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+	uint32_t i;
+
+	if (p->xdp_wan_on && p->wan && p->wan_nq)
+		bpf_xdp_detach(p->wan[0].ifindex, XDP_FLAGS_DRV_MODE, NULL);
 	if (p->xdp_loc2_on)
 		bpf_xdp_detach(p->loc2.ifindex, XDP_FLAGS_DRV_MODE, NULL);
 	if (p->xdp_loc_on)
@@ -296,13 +371,19 @@ void ne_pair_close(struct ne_pair *p)
 		bpf_object__close(p->bpf_loc);
 	p->bpf_wan = NULL;
 	p->bpf_loc = NULL;
-	if (p->wan.xsk)
-		xsk_socket__delete(p->wan.xsk);
+	if (p->wan) {
+		for (i = 0; i < p->wan_nq; i++) {
+			if (p->wan[i].xsk)
+				xsk_socket__delete(p->wan[i].xsk);
+		}
+		free(p->wan);
+	}
+	p->wan = NULL;
+	p->wan_nq = 0;
 	if (p->loc2.xsk)
 		xsk_socket__delete(p->loc2.xsk);
 	if (p->loc.xsk)
 		xsk_socket__delete(p->loc.xsk);
-	p->wan.xsk = NULL;
 	p->loc2.xsk = NULL;
 	p->loc.xsk = NULL;
 	if (p->umem)
@@ -342,7 +423,19 @@ int ne_recv_loc2(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 
 int ne_recv_wan(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
-	return ne_recv_port(&p->wan, lens, addrs, max);
+	uint32_t q;
+	int n;
+
+	if (!p->wan || !p->wan_nq)
+		return 0;
+	for (q = 0; q < p->wan_nq; q++) {
+		n = ne_recv_port(&p->wan[q], lens, addrs, max);
+		if (n > 0) {
+			p->wan_rx_q = q;
+			return n;
+		}
+	}
+	return 0;
 }
 
 void ne_recv_loc_release(struct ne_pair *p, unsigned int n)
@@ -359,8 +452,9 @@ void ne_recv_loc2_release(struct ne_pair *p, unsigned int n)
 
 void ne_recv_wan_release(struct ne_pair *p, unsigned int n)
 {
-	if (n)
-		xsk_ring_cons__release(&p->wan.rx, n);
+	if (!n || !p->wan || !p->wan_nq || p->wan_rx_q >= p->wan_nq)
+		return;
+	xsk_ring_cons__release(&p->wan[p->wan_rx_q].rx, n);
 }
 
 
@@ -504,10 +598,10 @@ int ne_tx_drain_loc(struct ne_pair *p, struct ne_ring *src)
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src)
 {
-    int xfd = xsk_socket__fd(p->wan.xsk);
-    struct xsk_ring_prod *tx_ring = &p->wan.tx;
-
-    return ne_tx_drain_port(xfd, tx_ring, src, p->frame_size);
+	if (!p->wan || !p->wan_nq)
+		return 0;
+	return ne_tx_drain_port(xsk_socket__fd(p->wan[0].xsk),
+				&p->wan[0].tx, src, p->frame_size);
 }
 static void ne_drain_cq_port(struct ne_zc_port *port, struct ne_pool *pool)
 {
@@ -537,7 +631,12 @@ void ne_drain_cq_loc2(struct ne_pair *p)
 
 void ne_drain_cq_wan(struct ne_pair *p)
 {
-	ne_drain_cq_port(&p->wan, &p->pool);
+	uint32_t q;
+
+	if (!p->wan || !p->wan_nq)
+		return;
+	for (q = 0; q < p->wan_nq; q++)
+		ne_drain_cq_port(&p->wan[q], &p->pool);
 }
 
 static void ne_refill_fq_port(struct ne_zc_port *port, struct ne_pool *pool)
@@ -573,5 +672,10 @@ void ne_refill_fq_loc2(struct ne_pair *p)
 
 void ne_refill_fq_wan(struct ne_pair *p)
 {
-	ne_refill_fq_port(&p->wan, &p->pool);
+	uint32_t q;
+
+	if (!p->wan || !p->wan_nq)
+		return;
+	for (q = 0; q < p->wan_nq; q++)
+		ne_refill_fq_port(&p->wan[q], &p->pool);
 }
