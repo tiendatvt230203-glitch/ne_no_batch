@@ -23,7 +23,7 @@ src/interface.o: src/interface.c inc/ne.h
 	@mkdir -p src
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/threads.o: src/threads.c inc/ne.h inc/mac.h
+src/threads.o: src/threads.c inc/ne.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 bpf/xdp_local.o: bpf/xdp_local.c

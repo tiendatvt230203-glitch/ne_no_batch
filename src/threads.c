@@ -2,11 +2,10 @@
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include <linux/if_ether.h>
-
 #include "ne.h"
-#include "mac.h"
 
 static void setaffinity(unsigned int cpu)
 {
@@ -17,21 +16,34 @@ static void setaffinity(unsigned int cpu)
 	pthread_setaffinity_np(pthread_self(), sizeof(s), &s);
 }
 
-static void rewrite_eth(struct ne_pair *zc, uint64_t addr, enum ne_dir d)
+static int mid_insert_wan_marker(struct ne_pair *zc, struct ne_job *j)
 {
-	uint8_t *pkt = ne_ptr(zc, addr);
-	static const uint8_t wan_dst[] = { MAC_WAN_DST };
-	static const uint8_t wan_src[] = { MAC_WAN_SRC };
-	static const uint8_t loc_dst[] = { MAC_LOC_DST };
-	static const uint8_t loc_src[] = { MAC_LOC_SRC };
+	uint8_t *pkt = ne_ptr(zc, j->umem_addr);
+	struct ethhdr *eth = (struct ethhdr *)pkt;
+	uint32_t pay_len;
+	struct ne_marker *m;
 
-	if (d == NE_DIR_TO_WAN) {
-		memcpy(pkt, wan_dst, ETH_ALEN);
-		memcpy(pkt + ETH_ALEN, wan_src, ETH_ALEN);
-	} else {
-		memcpy(pkt, loc_dst, ETH_ALEN);
-		memcpy(pkt + ETH_ALEN, loc_src, ETH_ALEN);
-	}
+	if (j->len < ETH_ALEN)
+		return -1;
+	if ((uint64_t)j->len + NE_MARKER_SIZE > zc->frame_size)
+		return -1;
+
+	pay_len = j->len - ETH_ALEN;
+	if (pay_len != 0)
+		memmove(pkt + NE_ENCAP_OVERHEAD, pkt + ETH_ALEN, pay_len);
+
+	m = (struct ne_marker *)(pkt + NE_MARKER_OFFSET);
+	memset(m, 0, sizeof(*m));
+	m->frag_idx = 0;
+	m->total = 1;
+	eth->h_proto = htons(NE_MAGIC_ETHERTYPE);
+
+	j->len += NE_MARKER_SIZE;
+	j->conn_id = 0;
+	j->pair_id = 0;
+	j->frag_idx = 0;
+	j->total = 1;
+	return 0;
 }
 
 static void *loc_worker(void *arg)
@@ -49,9 +61,9 @@ static void *loc_worker(void *arg)
 		ne_refill_fq_loc(&ctx->zc);
 		(void)ne_tx_drain_loc(&ctx->zc, &ctx->w_to_loc);
 		if (ne_recv_loc(&ctx->zc, &len, &addr, 1) > 0) {
+			memset(&j, 0, sizeof(j));
 			j.umem_addr = addr;
 			j.len = len;
-			j._pad = 0;
 			while (!ctx->stop &&
 			       ne_ring_try_push(&ctx->ing_to_mid, &j) != 0)
 				(void)ne_tx_drain_loc(&ctx->zc, &ctx->w_to_loc);
@@ -74,17 +86,29 @@ static void *wan_worker(void *arg)
 		if (ctx->stop)
 			break;
 		ne_drain_cq_wan(&ctx->zc);
+		ne_drain_cq_wan2(&ctx->zc);
 		ne_refill_fq_wan(&ctx->zc);
-		(void)ne_tx_drain_wan(&ctx->zc, &ctx->w_to_wan);
+		ne_refill_fq_wan2(&ctx->zc);
+		(void)ne_tx_drain_wan_rr(&ctx->zc, &ctx->w_to_wan);
 		if (ne_recv_wan(&ctx->zc, &len, &addr, 1) > 0) {
+			memset(&j, 0, sizeof(j));
 			j.umem_addr = addr;
 			j.len = len;
-			j._pad = 0;
 			while (!ctx->stop &&
 			       ne_ring_try_push(&ctx->wan_to_mid, &j) != 0)
-				(void)ne_tx_drain_wan(&ctx->zc, &ctx->w_to_wan);
+				(void)ne_tx_drain_wan_rr(&ctx->zc, &ctx->w_to_wan);
 			if (!ctx->stop)
 				ne_recv_wan_release(&ctx->zc, 1u);
+		}
+		if (ne_recv_wan2(&ctx->zc, &len, &addr, 1) > 0) {
+			memset(&j, 0, sizeof(j));
+			j.umem_addr = addr;
+			j.len = len;
+			while (!ctx->stop &&
+			       ne_ring_try_push(&ctx->wan_to_mid, &j) != 0)
+				(void)ne_tx_drain_wan_rr(&ctx->zc, &ctx->w_to_wan);
+			if (!ctx->stop)
+				ne_recv_wan2_release(&ctx->zc, 1u);
 		}
 	}
 	return NULL;
@@ -101,13 +125,15 @@ static void *mid_worker(void *arg)
 			break;
 
 		if (ne_ring_try_pop(&ctx->ing_to_mid, &j) == 0) {
-			rewrite_eth(&ctx->zc, j.umem_addr, NE_DIR_TO_WAN);
+			if (mid_insert_wan_marker(&ctx->zc, &j) != 0) {
+				(void)ne_pool_push(&ctx->zc.pool, &j.umem_addr, 1);
+				continue;
+			}
 			while (!ctx->stop &&
 			       ne_ring_try_push(&ctx->w_to_wan, &j) != 0)
 				;
 		}
 		if (ne_ring_try_pop(&ctx->wan_to_mid, &j) == 0) {
-			rewrite_eth(&ctx->zc, j.umem_addr, NE_DIR_TO_LOC);
 			while (!ctx->stop &&
 			       ne_ring_try_push(&ctx->w_to_loc, &j) != 0)
 				;
@@ -117,10 +143,10 @@ static void *mid_worker(void *arg)
 }
 
 int ne_run(struct ne_ctx *ctx, const char *loc_if, const char *wan_if,
-	   const char *bpf_loc, const char *bpf_wan)
+	   const char *wan2_if, const char *bpf_loc, const char *bpf_wan)
 {
 	memset(ctx, 0, sizeof(*ctx));
-	if (ne_pair_open(&ctx->zc, loc_if, wan_if, bpf_loc, bpf_wan) < 0)
+	if (ne_pair_open(&ctx->zc, loc_if, wan_if, wan2_if, bpf_loc, bpf_wan) < 0)
 		return -1;
 	if (ne_ring_init(&ctx->ing_to_mid, NE_RING) ||
 	    ne_ring_init(&ctx->wan_to_mid, NE_RING) ||
