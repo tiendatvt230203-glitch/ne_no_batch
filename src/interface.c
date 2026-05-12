@@ -1,13 +1,20 @@
-#define _GNU_SOURCE
+#include <errno.h>
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
+
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 02000000
+#endif
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -15,11 +22,170 @@
 
 #include "ne.h"
 
-struct bpf_xdp_attach_opts;
-int bpf_xdp_attach(int ifindex, int prog_fd, __u32 flags,
-		   const struct bpf_xdp_attach_opts *opts);
-int bpf_xdp_detach(int ifindex, __u32 flags,
-		   const struct bpf_xdp_attach_opts *opts);
+#if !defined(NLA_F_NESTED) && defined(NLA_F_NEST)
+#define NLA_F_NESTED NLA_F_NEST
+#endif
+#if !defined(NLA_F_NESTED)
+#define NLA_F_NESTED (1U << 15)
+#endif
+
+#define NE_NLMSG_TAIL(nmsg)                                                   \
+	((struct rtattr *)(void *)((char *)(nmsg) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+
+static int ne_rtnl_addattr(struct nlmsghdr *n, size_t maxlen, unsigned short type,
+			   const void *data, unsigned short alen)
+{
+	size_t len = RTA_LENGTH(alen);
+	struct rtattr *rta;
+
+	if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > maxlen)
+		return -EMSGSIZE;
+	rta = NE_NLMSG_TAIL(n);
+	rta->rta_type = type;
+	rta->rta_len = (unsigned short)len;
+	if (alen)
+		memcpy(RTA_DATA(rta), data, alen);
+	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + (unsigned int)RTA_ALIGN(len);
+	return 0;
+}
+
+static struct rtattr *ne_rtnl_nest(struct nlmsghdr *n, size_t maxlen,
+				   unsigned short type)
+{
+	struct rtattr *nest = NE_NLMSG_TAIL(n);
+
+	if (ne_rtnl_addattr(n, maxlen, type, NULL, 0) < 0)
+		return NULL;
+	return nest;
+}
+
+static void ne_rtnl_nest_end(struct nlmsghdr *n, struct rtattr *nest)
+{
+	nest->rta_len = (unsigned short)((char *)NE_NLMSG_TAIL(n) - (char *)nest);
+}
+
+static int ne_rtnl_open(unsigned int *nl_pid_out)
+{
+	struct sockaddr_nl snl = {};
+	int sock;
+	socklen_t sl = sizeof(snl);
+
+	sock = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (sock < 0)
+		return -errno;
+	if (bind(sock, (struct sockaddr *)&snl, sizeof(snl)) < 0) {
+		int e = errno;
+
+		close(sock);
+		return -e;
+	}
+	if (getsockname(sock, (struct sockaddr *)&snl, &sl) < 0) {
+		int e = errno;
+
+		close(sock);
+		return -e;
+	}
+	*nl_pid_out = snl.nl_pid;
+	return sock;
+}
+
+static int ne_rtnl_setlink_xdp(int sock, unsigned int nl_pid, unsigned int seq,
+			       struct nlmsghdr *req)
+{
+	struct sockaddr_nl dst = {};
+	struct iovec siov = { req, req->nlmsg_len };
+	struct msghdr smsg = {
+		.msg_name = &dst,
+		.msg_namelen = sizeof(dst),
+		.msg_iov = &siov,
+		.msg_iovlen = 1,
+	};
+	unsigned char rcv[8192];
+
+	dst.nl_family = AF_NETLINK;
+	if (sendmsg(sock, &smsg, 0) < 0)
+		return -errno;
+
+	for (;;) {
+		struct iovec riov = { rcv, sizeof(rcv) };
+		struct msghdr rmsg = {
+			.msg_iov = &riov,
+			.msg_iovlen = 1,
+		};
+		ssize_t len = recvmsg(sock, &rmsg, 0);
+
+		if (len < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (len == 0)
+			return -EIO;
+
+		for (struct nlmsghdr *nh = (struct nlmsghdr *)rcv;
+		     NLMSG_OK(nh, (size_t)len); nh = NLMSG_NEXT(nh, len)) {
+			if (nh->nlmsg_pid != nl_pid || nh->nlmsg_seq != seq)
+				continue;
+			if (nh->nlmsg_type == NLMSG_ERROR) {
+				const struct nlmsgerr *err =
+				    (const struct nlmsgerr *)NLMSG_DATA(nh);
+
+				return err->error;
+			}
+		}
+	}
+}
+
+static int ne_rtnl_xdp(int ifindex, int fd, __u32 flags)
+{
+	unsigned char buf[512];
+	struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+	struct ifinfomsg *ifi;
+	struct rtattr *nest;
+	unsigned int seq = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+	unsigned int nl_pid = 0;
+	int sock;
+	int ret;
+
+	memset(buf, 0, sizeof(buf));
+	nh->nlmsg_len = NLMSG_LENGTH(sizeof(*ifi));
+	nh->nlmsg_type = RTM_SETLINK;
+	nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nh->nlmsg_seq = seq;
+
+	ifi = NLMSG_DATA(nh);
+	memset(ifi, 0, sizeof(*ifi));
+	ifi->ifi_family = AF_UNSPEC;
+	ifi->ifi_index = ifindex;
+
+	nest = ne_rtnl_nest(nh, sizeof(buf), IFLA_XDP | NLA_F_NESTED);
+	if (!nest)
+		return -EMSGSIZE;
+	if (ne_rtnl_addattr(nh, sizeof(buf), IFLA_XDP_FD, &fd, sizeof(fd)) < 0)
+		return -EMSGSIZE;
+	if (flags &&
+	    ne_rtnl_addattr(nh, sizeof(buf), IFLA_XDP_FLAGS, &flags,
+			    sizeof(flags)) < 0)
+		return -EMSGSIZE;
+	ne_rtnl_nest_end(nh, nest);
+
+	sock = ne_rtnl_open(&nl_pid);
+	if (sock < 0)
+		return sock;
+	ret = ne_rtnl_setlink_xdp(sock, nl_pid, seq, nh);
+	close(sock);
+	return ret;
+}
+
+static int ne_xdp_attach(int ifindex, int prog_fd, __u32 flags)
+{
+	return ne_rtnl_xdp(ifindex, prog_fd, flags);
+}
+
+static int ne_xdp_detach(int ifindex, __u32 flags)
+{
+	return ne_rtnl_xdp(ifindex, -1, flags);
+}
 
 static int ne_xskmap_bind(struct xsk_socket *xsk, int map_fd)
 {
@@ -230,14 +396,14 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	pw2 = bpf_object__find_program_by_name(p->bpf_wan2,
 					       "xdp_wan_redirect_prog");
 	NE_TRY(!pl || !pw || !pw2);
-	NE_TRY(bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
-			      XDP_FLAGS_DRV_MODE, NULL));
+	NE_TRY(ne_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
+			     XDP_FLAGS_DRV_MODE));
 	p->xdp_loc_on = 1;
-	NE_TRY(bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
-			      XDP_FLAGS_DRV_MODE, NULL));
+	NE_TRY(ne_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
+			     XDP_FLAGS_DRV_MODE));
 	p->xdp_wan_on = 1;
-	NE_TRY(bpf_xdp_attach(p->wan2.ifindex, bpf_program__fd(pw2),
-			      XDP_FLAGS_DRV_MODE, NULL));
+	NE_TRY(ne_xdp_attach(p->wan2.ifindex, bpf_program__fd(pw2),
+			     XDP_FLAGS_DRV_MODE));
 	p->xdp_wan2_on = 1;
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
 	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
@@ -256,11 +422,11 @@ fail:
 void ne_pair_close(struct ne_pair *p)
 {
 	if (p->xdp_wan2_on)
-		bpf_xdp_detach(p->wan2.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		(void)ne_xdp_detach(p->wan2.ifindex, XDP_FLAGS_DRV_MODE);
 	if (p->xdp_wan_on)
-		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		(void)ne_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE);
 	if (p->xdp_loc_on)
-		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		(void)ne_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE);
 	p->xdp_wan2_on = 0;
 	p->xdp_wan_on = 0;
 	p->xdp_loc_on = 0;
