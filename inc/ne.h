@@ -20,6 +20,7 @@ struct bpf_object;
 struct ne_job {
 	uint64_t umem_addr;
 	uint32_t len;
+	uint32_t rx_ifidx;
 };
 
 struct ne_ring {
@@ -39,6 +40,8 @@ struct ne_pool {
 	pthread_spinlock_t lock;
 };
 
+#define NE_ETH_ALEN 6u
+
 struct ne_zc_port {
 	struct xsk_socket *xsk;
 	struct xsk_ring_cons rx;
@@ -46,6 +49,8 @@ struct ne_zc_port {
 	struct xsk_ring_prod fq;
 	struct xsk_ring_cons cq;
 	int ifindex;
+	uint8_t hwaddr[NE_ETH_ALEN];
+	uint8_t hwaddr_valid;
 };
 
 struct ne_pair {
@@ -55,11 +60,13 @@ struct ne_pair {
 	uint32_t n_frames;
 	struct xsk_umem *umem;
 	struct ne_zc_port loc;
+	struct ne_zc_port loc2;
 	struct ne_zc_port wan;
 	struct ne_pool pool;
 	struct bpf_object *bpf_loc;
 	struct bpf_object *bpf_wan;
 	uint8_t xdp_loc_on;
+	uint8_t xdp_loc2_on;
 	uint8_t xdp_wan_on;
 };
 
@@ -74,19 +81,24 @@ void ne_pool_destroy(struct ne_pool *p);
 uint32_t ne_pool_push(struct ne_pool *p, const uint64_t *addrs, uint32_t n);
 uint32_t ne_pool_pop(struct ne_pool *p, uint64_t *addrs, uint32_t n);
 
-int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
-		 const char *bpf_loc_o, const char *bpf_wan_o);
+int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
+		 const char *wan_if, const char *bpf_loc_o,
+		 const char *bpf_wan_o);
 void ne_pair_close(struct ne_pair *p);
 
 int ne_recv_loc(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max);
+int ne_recv_loc2(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max);
 int ne_recv_wan(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max);
 void ne_recv_loc_release(struct ne_pair *p, unsigned int n);
+void ne_recv_loc2_release(struct ne_pair *p, unsigned int n);
 void ne_recv_wan_release(struct ne_pair *p, unsigned int n);
 int ne_tx_drain_loc(struct ne_pair *p, struct ne_ring *src);
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src);
 void ne_drain_cq_loc(struct ne_pair *p);
+void ne_drain_cq_loc2(struct ne_pair *p);
 void ne_drain_cq_wan(struct ne_pair *p);
 void ne_refill_fq_loc(struct ne_pair *p);
+void ne_refill_fq_loc2(struct ne_pair *p);
 void ne_refill_fq_wan(struct ne_pair *p);
 void *ne_ptr(struct ne_pair *p, uint64_t addr);
 
@@ -102,8 +114,8 @@ struct ne_ctx {
 	pthread_t th_wan;
 };
 
-int ne_run(struct ne_ctx *ctx, const char *loc_if, const char *wan_if,
-	   const char *bpf_loc, const char *bpf_wan);
+int ne_run(struct ne_ctx *ctx, const char *loc_if, const char *loc2_if,
+	   const char *wan_if, const char *bpf_loc, const char *bpf_wan);
 void ne_ctx_stop(struct ne_ctx *ctx);
 void ne_ctx_join(struct ne_ctx *ctx);
 

@@ -1,6 +1,9 @@
 #include <net/if.h>
+#include <sys/ioctl.h>
+#include <linux/if_ether.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -20,9 +23,27 @@ int bpf_xdp_attach(int ifindex, int prog_fd, __u32 flags,
 int bpf_xdp_detach(int ifindex, __u32 flags,
 		   const struct bpf_xdp_attach_opts *opts);
 
-static int ne_xskmap_bind(struct xsk_socket *xsk, int map_fd)
+static int ne_if_hwaddr(const char *ifname, uint8_t *out)
 {
-	int key = 0;
+	struct ifreq ifr;
+	int fd;
+	int ret;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	ret = ioctl(fd, SIOCGIFHWADDR, &ifr);
+	close(fd);
+	if (ret < 0)
+		return -1;
+	memcpy(out, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	return 0;
+}
+
+static int ne_xskmap_bind(struct xsk_socket *xsk, int map_fd, int key)
+{
 	int xfd = xsk_socket__fd(xsk);
 
 	if (xsk_socket__update_xskmap(xsk, map_fd) == 0)
@@ -155,8 +176,9 @@ static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
 					 &port->fq, &port->cq, &cfg);
 }
 
-int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
-		 const char *bpf_loc_o, const char *bpf_wan_o)
+int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *loc2_if,
+		 const char *wan_if, const char *bpf_loc_o,
+		 const char *bpf_wan_o)
 {
 #define NE_TRY(expr) do { if (expr) goto fail; } while (0)
 	struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
@@ -171,8 +193,11 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	struct bpf_program *pw;
 	struct bpf_map *ml;
 	struct bpf_map *mw;
+	struct bpf_map *mif;
 	uint64_t a;
 	uint32_t i, pi, idx, per_fq, want;
+	int fd_ml;
+	uint32_t k0 = 0, k1 = 1;
 
 	memset(p, 0, sizeof(*p));
 	p->frame_size = NE_FRAME;
@@ -193,12 +218,19 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	NE_TRY(ne_sock_open(p, &p->loc, loc_if));
 	p->loc.ifindex = if_nametoindex(loc_if);
 	NE_TRY(!p->loc.ifindex);
+	p->loc.hwaddr_valid = (uint8_t)(ne_if_hwaddr(loc_if, p->loc.hwaddr) == 0);
+	NE_TRY(ne_sock_open(p, &p->loc2, loc2_if));
+	p->loc2.ifindex = if_nametoindex(loc2_if);
+	NE_TRY(!p->loc2.ifindex);
+	p->loc2.hwaddr_valid =
+	    (uint8_t)(ne_if_hwaddr(loc2_if, p->loc2.hwaddr) == 0);
 	NE_TRY(ne_sock_open(p, &p->wan, wan_if));
 	p->wan.ifindex = if_nametoindex(wan_if);
 	NE_TRY(!p->wan.ifindex);
 	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
-	for (pi = 0; pi < 2; pi++) {
-		struct ne_zc_port *port = pi ? &p->wan : &p->loc;
+	for (pi = 0; pi < 3; pi++) {
+		struct ne_zc_port *port =
+		    pi == 0 ? &p->loc : (pi == 1 ? &p->loc2 : &p->wan);
 
 		for (want = per_fq; want > 0; want--) {
 			if (ne_pool_pop(&p->pool, &a, 1) != 1)
@@ -222,14 +254,24 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	NE_TRY(bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
 			      XDP_FLAGS_DRV_MODE, NULL));
 	p->xdp_loc_on = 1;
+	NE_TRY(bpf_xdp_attach(p->loc2.ifindex, bpf_program__fd(pl),
+			      XDP_FLAGS_DRV_MODE, NULL));
+	p->xdp_loc2_on = 1;
 	NE_TRY(bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
 			      XDP_FLAGS_DRV_MODE, NULL));
 	p->xdp_wan_on = 1;
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
+	mif = bpf_object__find_map_by_name(p->bpf_loc, "loc_if_xsk");
 	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
-	NE_TRY(!ml || !mw);
-	NE_TRY(ne_xskmap_bind(p->loc.xsk, bpf_map__fd(ml)));
-	NE_TRY(ne_xskmap_bind(p->wan.xsk, bpf_map__fd(mw)));
+	NE_TRY(!ml || !mif || !mw);
+	fd_ml = bpf_map__fd(ml);
+	NE_TRY(ne_xskmap_bind(p->loc.xsk, fd_ml, 0));
+	NE_TRY(ne_xskmap_bind(p->loc2.xsk, fd_ml, 1));
+	NE_TRY(ne_xskmap_bind(p->wan.xsk, bpf_map__fd(mw), 0));
+	NE_TRY(bpf_map_update_elem(bpf_map__fd(mif), &p->loc.ifindex, &k0,
+				   BPF_ANY));
+	NE_TRY(bpf_map_update_elem(bpf_map__fd(mif), &p->loc2.ifindex, &k1,
+				   BPF_ANY));
 #undef NE_TRY
 	return 0;
 fail:
@@ -241,9 +283,12 @@ void ne_pair_close(struct ne_pair *p)
 {
 	if (p->xdp_wan_on)
 		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+	if (p->xdp_loc2_on)
+		bpf_xdp_detach(p->loc2.ifindex, XDP_FLAGS_DRV_MODE, NULL);
 	if (p->xdp_loc_on)
 		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
 	p->xdp_wan_on = 0;
+	p->xdp_loc2_on = 0;
 	p->xdp_loc_on = 0;
 	if (p->bpf_wan)
 		bpf_object__close(p->bpf_wan);
@@ -253,9 +298,12 @@ void ne_pair_close(struct ne_pair *p)
 	p->bpf_loc = NULL;
 	if (p->wan.xsk)
 		xsk_socket__delete(p->wan.xsk);
+	if (p->loc2.xsk)
+		xsk_socket__delete(p->loc2.xsk);
 	if (p->loc.xsk)
 		xsk_socket__delete(p->loc.xsk);
 	p->wan.xsk = NULL;
+	p->loc2.xsk = NULL;
 	p->loc.xsk = NULL;
 	if (p->umem)
 		xsk_umem__delete(p->umem);
@@ -287,6 +335,11 @@ int ne_recv_loc(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 	return ne_recv_port(&p->loc, lens, addrs, max);
 }
 
+int ne_recv_loc2(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
+{
+	return ne_recv_port(&p->loc2, lens, addrs, max);
+}
+
 int ne_recv_wan(struct ne_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
 	return ne_recv_port(&p->wan, lens, addrs, max);
@@ -298,6 +351,12 @@ void ne_recv_loc_release(struct ne_pair *p, unsigned int n)
 		xsk_ring_cons__release(&p->loc.rx, n);
 }
 
+void ne_recv_loc2_release(struct ne_pair *p, unsigned int n)
+{
+	if (n)
+		xsk_ring_cons__release(&p->loc2.rx, n);
+}
+
 void ne_recv_wan_release(struct ne_pair *p, unsigned int n)
 {
 	if (n)
@@ -305,53 +364,142 @@ void ne_recv_wan_release(struct ne_pair *p, unsigned int n)
 }
 
 
-static int ne_tx_drain_port(int xfd, struct xsk_ring_prod *tx_ring, 
-                            struct ne_ring *src, uint32_t max_frame)
+static int ne_tx_drain_port(int xfd, struct xsk_ring_prod *tx_ring,
+			    struct ne_ring *src, uint32_t max_frame)
 {
-    struct ne_job j;
-    uint32_t idx;
-    uint32_t tx_len;
-    int sent = 0;
+	struct ne_job j;
+	uint32_t idx;
+	uint32_t tx_len;
+	int sent = 0;
 
-    for (;;) {
-        struct xdp_desc *d;
+	for (;;) {
+		struct xdp_desc *d;
 
-        if (xsk_prod_nb_free(tx_ring, 1) < 1)
-            break;
+		if (xsk_prod_nb_free(tx_ring, 1) < 1)
+			break;
 
-        if (ne_ring_try_pop(src, &j) != 0)
-            break;
+		if (ne_ring_try_pop(src, &j) != 0)
+			break;
 
-        if (xsk_ring_prod__reserve(tx_ring, 1, &idx) != 1) {
-            while (ne_ring_try_push(src, &j) != 0)
-                ;
-            break;
-        }
+		if (xsk_ring_prod__reserve(tx_ring, 1, &idx) != 1) {
+			while (ne_ring_try_push(src, &j) != 0)
+				;
+			break;
+		}
 
-        d = xsk_ring_prod__tx_desc(tx_ring, idx);
-        d->addr = j.umem_addr;
-        tx_len = j.len;
-        d->len = tx_len > max_frame ? max_frame : tx_len;
-        
-        xsk_ring_prod__submit(tx_ring, 1);
-        sent++;
-    }
+		d = xsk_ring_prod__tx_desc(tx_ring, idx);
+		d->addr = j.umem_addr;
+		tx_len = j.len;
+		d->len = tx_len > max_frame ? max_frame : tx_len;
 
-    if (sent > 0) {
-        if (xsk_ring_prod__needs_wakeup(tx_ring)) {
-            (void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
-        }
-    }
+		xsk_ring_prod__submit(tx_ring, 1);
+		sent++;
+	}
 
-    return sent;
+	if (sent > 0 && xsk_ring_prod__needs_wakeup(tx_ring))
+		(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+
+	return sent;
+}
+
+static const unsigned char ne_mac_loc[][ETH_ALEN] = {
+	{ 0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x05 },
+	{ 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xf3 },
+};
+static const unsigned char ne_mac_loc2[][ETH_ALEN] = {
+	{ 0x20, 0x7c, 0x14, 0xf8, 0x0c, 0xf5 },
+	{ 0x20, 0x7c, 0x14, 0xf8, 0x0d, 0x07 },
+};
+
+static int ne_mac_in_pair(const unsigned char *m,
+			  const unsigned char pair[][ETH_ALEN])
+{
+	return memcmp(m, pair[0], ETH_ALEN) == 0 ||
+	       memcmp(m, pair[1], ETH_ALEN) == 0;
+}
+
+static int ne_mac_on_loc(const struct ne_pair *p, const unsigned char *m)
+{
+	if (ne_mac_in_pair(m, ne_mac_loc))
+		return 1;
+	return p->loc.hwaddr_valid &&
+	       memcmp(m, p->loc.hwaddr, ETH_ALEN) == 0;
+}
+
+static int ne_mac_on_loc2(const struct ne_pair *p, const unsigned char *m)
+{
+	if (ne_mac_in_pair(m, ne_mac_loc2))
+		return 1;
+	return p->loc2.hwaddr_valid &&
+	       memcmp(m, p->loc2.hwaddr, ETH_ALEN) == 0;
+}
+
+static struct ne_zc_port *ne_pick_loc_tx(struct ne_pair *p,
+					 const struct ne_job *j)
+{
+	if (j->rx_ifidx &&
+	    (unsigned int)j->rx_ifidx == (unsigned int)p->loc2.ifindex)
+		return &p->loc2;
+	if (j->rx_ifidx)
+		return &p->loc;
+
+	if (j->len >= ETH_HLEN) {
+		const struct ethhdr *eth = ne_ptr(p, j->umem_addr);
+
+		if (ne_mac_on_loc(p, eth->h_dest) ||
+		    ne_mac_on_loc(p, eth->h_source))
+			return &p->loc;
+		if (ne_mac_on_loc2(p, eth->h_dest) ||
+		    ne_mac_on_loc2(p, eth->h_source))
+			return &p->loc2;
+	}
+	return &p->loc;
 }
 
 int ne_tx_drain_loc(struct ne_pair *p, struct ne_ring *src)
 {
-    int xfd = xsk_socket__fd(p->loc.xsk);
-    struct xsk_ring_prod *tx_ring = &p->loc.tx;
+	struct ne_job j;
+	uint32_t idx;
+	uint32_t tx_len;
+	struct ne_zc_port *port;
+	int xfd;
+	struct xsk_ring_prod *tx;
+	int sent = 0;
 
-    return ne_tx_drain_port(xfd, tx_ring, src, p->frame_size);
+	for (;;) {
+		struct xdp_desc *d;
+
+		if (ne_ring_try_pop(src, &j) != 0)
+			break;
+
+		port = ne_pick_loc_tx(p, &j);
+		tx = &port->tx;
+		xfd = xsk_socket__fd(port->xsk);
+
+		if (xsk_prod_nb_free(tx, 1) < 1) {
+			while (ne_ring_try_push(src, &j) != 0)
+				;
+			break;
+		}
+
+		if (xsk_ring_prod__reserve(tx, 1, &idx) != 1) {
+			while (ne_ring_try_push(src, &j) != 0)
+				;
+			break;
+		}
+
+		d = xsk_ring_prod__tx_desc(tx, idx);
+		d->addr = j.umem_addr;
+		tx_len = j.len;
+		d->len = tx_len > p->frame_size ? p->frame_size : tx_len;
+		xsk_ring_prod__submit(tx, 1);
+		sent++;
+
+		if (xsk_ring_prod__needs_wakeup(tx))
+			(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+	}
+
+	return sent;
 }
 
 int ne_tx_drain_wan(struct ne_pair *p, struct ne_ring *src)
@@ -380,6 +528,11 @@ static void ne_drain_cq_port(struct ne_zc_port *port, struct ne_pool *pool)
 void ne_drain_cq_loc(struct ne_pair *p)
 {
 	ne_drain_cq_port(&p->loc, &p->pool);
+}
+
+void ne_drain_cq_loc2(struct ne_pair *p)
+{
+	ne_drain_cq_port(&p->loc2, &p->pool);
 }
 
 void ne_drain_cq_wan(struct ne_pair *p)
@@ -411,6 +564,11 @@ static void ne_refill_fq_port(struct ne_zc_port *port, struct ne_pool *pool)
 void ne_refill_fq_loc(struct ne_pair *p)
 {
 	ne_refill_fq_port(&p->loc, &p->pool);
+}
+
+void ne_refill_fq_loc2(struct ne_pair *p)
+{
+	ne_refill_fq_port(&p->loc2, &p->pool);
 }
 
 void ne_refill_fq_wan(struct ne_pair *p)
