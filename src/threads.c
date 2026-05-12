@@ -1,5 +1,7 @@
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -156,10 +158,32 @@ int ne_run(struct ne_ctx *ctx, const char *loc_if, const char *wan_if,
 		return -1;
 	}
 	ctx->stop = 0;
-	pthread_create(&ctx->th_loc, NULL, loc_worker, ctx);
-	pthread_create(&ctx->th_mid, NULL, mid_worker, ctx);
-	pthread_create(&ctx->th_wan, NULL, wan_worker, ctx);
+	if (pthread_create(&ctx->th_loc, NULL, loc_worker, ctx) != 0) {
+		fprintf(stderr, "necz1: pthread_create loc: %s\n",
+			strerror(errno));
+		goto fail_pt;
+	}
+	if (pthread_create(&ctx->th_mid, NULL, mid_worker, ctx) != 0) {
+		fprintf(stderr, "necz1: pthread_create mid: %s\n",
+			strerror(errno));
+		goto fail_mid;
+	}
+	if (pthread_create(&ctx->th_wan, NULL, wan_worker, ctx) != 0) {
+		fprintf(stderr, "necz1: pthread_create wan: %s\n",
+			strerror(errno));
+		goto fail_wan;
+	}
 	return 0;
+
+fail_wan:
+	ctx->stop = 1;
+	pthread_join(ctx->th_mid, NULL);
+fail_mid:
+	ctx->stop = 1;
+	pthread_join(ctx->th_loc, NULL);
+fail_pt:
+	ne_pair_close(&ctx->zc);
+	return -1;
 }
 
 void ne_ctx_stop(struct ne_ctx *ctx)

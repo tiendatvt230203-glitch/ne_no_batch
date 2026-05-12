@@ -1,4 +1,5 @@
 #include <signal.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include "ne.h"
@@ -28,8 +29,12 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_sig);
 	signal(SIGTERM, on_sig);
 
-	if (ne_run(&g_ctx, loc, wan, wan2, bpf_loc, bpf_wan))
+	if (ne_run(&g_ctx, loc, wan, wan2, bpf_loc, bpf_wan)) {
+		fprintf(stderr,
+			"necz1: startup failed (need root/CAP_NET_ADMIN? check "
+			"interface names and bpf/*.o path)\n");
 		return 1;
+	}
 
 	while (!g_ctx.stop)
 		pause();

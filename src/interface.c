@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <net/if.h>
+#include <stdio.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
 #include <linux/netlink.h>
@@ -21,6 +22,15 @@
 #include <xdp/xsk.h>
 
 #include "ne.h"
+
+static void ne_err_int(const char *what, int err)
+{
+	if (err < 0 && err > -4096)
+		fprintf(stderr, "necz1: %s: %s (%d)\n", what, strerror(-err),
+			err);
+	else
+		fprintf(stderr, "necz1: %s (%d)\n", what, err);
+}
 
 #if !defined(NLA_F_NESTED) && defined(NLA_F_NEST)
 #define NLA_F_NESTED NLA_F_NEST
@@ -124,7 +134,9 @@ static int ne_rtnl_setlink_xdp(int sock, unsigned int nl_pid, unsigned int seq,
 
 		for (struct nlmsghdr *nh = (struct nlmsghdr *)rcv;
 		     NLMSG_OK(nh, (size_t)len); nh = NLMSG_NEXT(nh, len)) {
-			if (nh->nlmsg_pid != nl_pid || nh->nlmsg_seq != seq)
+			if (nh->nlmsg_seq != seq)
+				continue;
+			if (nh->nlmsg_pid != nl_pid && nh->nlmsg_pid != 0)
 				continue;
 			if (nh->nlmsg_type == NLMSG_ERROR) {
 				const struct nlmsgerr *err =
@@ -325,7 +337,14 @@ static int ne_sock_open(struct ne_pair *p, struct ne_zc_port *port,
 int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 		 const char *wan2_if, const char *bpf_loc_o, const char *bpf_wan_o)
 {
-#define NE_TRY(expr) do { if (expr) goto fail; } while (0)
+#define NE_CHK(call, what)                                                      \
+	do {                                                                    \
+		int _ne_e = (call);                                             \
+		if (_ne_e) {                                                    \
+			ne_err_int((what), _ne_e);                              \
+			goto fail;                                              \
+		}                                                               \
+	} while (0)
 	struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
 	struct xsk_umem_config ucfg = {
 		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS * 2,
@@ -350,24 +369,39 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	setrlimit(RLIMIT_MEMLOCK, &rl);
 	p->bufs = mmap(NULL, p->bufsize, PROT_READ | PROT_WRITE,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (p->bufs == MAP_FAILED)
+	if (p->bufs == MAP_FAILED) {
+		fprintf(stderr, "necz1: mmap umem failed\n");
 		return -1;
-	NE_TRY(ne_pool_init(&p->pool, NE_N_FRAMES));
+	}
+	if (ne_pool_init(&p->pool, NE_N_FRAMES)) {
+		fprintf(stderr, "necz1: ne_pool_init failed\n");
+		goto fail;
+	}
 	for (i = 0; i < p->n_frames; i++) {
 		a = (uint64_t)i * p->frame_size;
 		(void)ne_pool_push(&p->pool, &a, 1);
 	}
-	NE_TRY(xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->loc.fq,
-				&p->loc.cq, &ucfg));
-	NE_TRY(ne_sock_open(p, &p->loc, loc_if));
+	NE_CHK(xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->loc.fq,
+				&p->loc.cq, &ucfg),
+	       "xsk_umem__create");
+	NE_CHK(ne_sock_open(p, &p->loc, loc_if), "xsk_socket loc");
 	p->loc.ifindex = if_nametoindex(loc_if);
-	NE_TRY(!p->loc.ifindex);
-	NE_TRY(ne_sock_open(p, &p->wan, wan_if));
+	if (!p->loc.ifindex) {
+		fprintf(stderr, "necz1: unknown interface (loc): %s\n", loc_if);
+		goto fail;
+	}
+	NE_CHK(ne_sock_open(p, &p->wan, wan_if), "xsk_socket wan");
 	p->wan.ifindex = if_nametoindex(wan_if);
-	NE_TRY(!p->wan.ifindex);
-	NE_TRY(ne_sock_open(p, &p->wan2, wan2_if));
+	if (!p->wan.ifindex) {
+		fprintf(stderr, "necz1: unknown interface (wan): %s\n", wan_if);
+		goto fail;
+	}
+	NE_CHK(ne_sock_open(p, &p->wan2, wan2_if), "xsk_socket wan2");
 	p->wan2.ifindex = if_nametoindex(wan2_if);
-	NE_TRY(!p->wan2.ifindex);
+	if (!p->wan2.ifindex) {
+		fprintf(stderr, "necz1: unknown interface (wan2): %s\n", wan2_if);
+		goto fail;
+	}
 	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
 	for (pi = 0; pi < 3; pi++) {
 		struct ne_zc_port *port =
@@ -387,32 +421,52 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	p->bpf_loc = bpf_object__open_file(bpf_loc_o, NULL);
 	p->bpf_wan = bpf_object__open_file(bpf_wan_o, NULL);
 	p->bpf_wan2 = bpf_object__open_file(bpf_wan_o, NULL);
-	NE_TRY(!p->bpf_loc || !p->bpf_wan || !p->bpf_wan2);
-	NE_TRY(bpf_object__load(p->bpf_loc));
-	NE_TRY(bpf_object__load(p->bpf_wan));
-	NE_TRY(bpf_object__load(p->bpf_wan2));
+	if (!p->bpf_loc || !p->bpf_wan || !p->bpf_wan2) {
+		fprintf(stderr,
+			"necz1: bpf_object__open_file failed (%s / %s missing?)\n",
+			bpf_loc_o, bpf_wan_o);
+		goto fail;
+	}
+	NE_CHK(bpf_object__load(p->bpf_loc), "bpf_object__load bpf_loc");
+	NE_CHK(bpf_object__load(p->bpf_wan), "bpf_object__load bpf_wan");
+	NE_CHK(bpf_object__load(p->bpf_wan2), "bpf_object__load bpf_wan2");
 	pl = bpf_object__find_program_by_name(p->bpf_loc, "xdp_redirect_prog");
 	pw = bpf_object__find_program_by_name(p->bpf_wan, "xdp_wan_redirect_prog");
 	pw2 = bpf_object__find_program_by_name(p->bpf_wan2,
 					       "xdp_wan_redirect_prog");
-	NE_TRY(!pl || !pw || !pw2);
-	NE_TRY(ne_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
-			     XDP_FLAGS_DRV_MODE));
+	if (!pl || !pw || !pw2) {
+		fprintf(stderr,
+			"necz1: missing BPF program symbol (xdp_redirect_prog / "
+			"xdp_wan_redirect_prog)\n");
+		goto fail;
+	}
+	NE_CHK(ne_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
+			   XDP_FLAGS_DRV_MODE),
+	       "xdp attach loc");
 	p->xdp_loc_on = 1;
-	NE_TRY(ne_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
-			     XDP_FLAGS_DRV_MODE));
+	NE_CHK(ne_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
+			   XDP_FLAGS_DRV_MODE),
+	       "xdp attach wan");
 	p->xdp_wan_on = 1;
-	NE_TRY(ne_xdp_attach(p->wan2.ifindex, bpf_program__fd(pw2),
-			     XDP_FLAGS_DRV_MODE));
+	NE_CHK(ne_xdp_attach(p->wan2.ifindex, bpf_program__fd(pw2),
+			   XDP_FLAGS_DRV_MODE),
+	       "xdp attach wan2");
 	p->xdp_wan2_on = 1;
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
 	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
 	mw2 = bpf_object__find_map_by_name(p->bpf_wan2, "wan_xsks_map");
-	NE_TRY(!ml || !mw || !mw2);
-	NE_TRY(ne_xskmap_bind(p->loc.xsk, bpf_map__fd(ml)));
-	NE_TRY(ne_xskmap_bind(p->wan.xsk, bpf_map__fd(mw)));
-	NE_TRY(ne_xskmap_bind(p->wan2.xsk, bpf_map__fd(mw2)));
-#undef NE_TRY
+	if (!ml || !mw || !mw2) {
+		fprintf(stderr,
+			"necz1: missing BPF map (xsks_map / wan_xsks_map)\n");
+		goto fail;
+	}
+	NE_CHK(ne_xskmap_bind(p->loc.xsk, bpf_map__fd(ml)),
+	       "bind xsks_map loc");
+	NE_CHK(ne_xskmap_bind(p->wan.xsk, bpf_map__fd(mw)),
+	       "bind wan_xsks_map wan");
+	NE_CHK(ne_xskmap_bind(p->wan2.xsk, bpf_map__fd(mw2)),
+	       "bind wan_xsks_map wan2");
+#undef NE_CHK
 	return 0;
 fail:
 	ne_pair_close(p);
