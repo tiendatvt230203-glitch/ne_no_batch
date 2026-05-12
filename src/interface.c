@@ -1,5 +1,7 @@
+#include <dlfcn.h>
 #include <errno.h>
 #include <net/if.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
@@ -189,13 +191,54 @@ static int ne_rtnl_xdp(int ifindex, int fd, __u32 flags)
 	return ret;
 }
 
+typedef int (*ne_set_link_xdp_fd_fn)(int ifindex, int fd, __u32 flags);
+typedef int (*ne_bpf_xdp_attach_fn)(int ifindex, int prog_fd, __u32 flags,
+				    const struct bpf_xdp_attach_opts *opts);
+typedef int (*ne_bpf_xdp_detach_fn)(int ifindex, __u32 flags,
+				    const struct bpf_xdp_attach_opts *opts);
+
+static ne_set_link_xdp_fd_fn ne_fn_set_link_xdp_fd;
+static ne_bpf_xdp_attach_fn ne_fn_bpf_xdp_attach;
+static ne_bpf_xdp_detach_fn ne_fn_bpf_xdp_detach;
+
+static void ne_xdp_resolve_syms(void)
+{
+	static int done;
+
+	if (done)
+		return;
+	done = 1;
+	ne_fn_set_link_xdp_fd =
+	    (ne_set_link_xdp_fd_fn)(uintptr_t)dlsym(RTLD_DEFAULT,
+						      "bpf_set_link_xdp_fd");
+	ne_fn_bpf_xdp_attach =
+	    (ne_bpf_xdp_attach_fn)(uintptr_t)dlsym(RTLD_DEFAULT,
+						   "bpf_xdp_attach");
+	ne_fn_bpf_xdp_detach =
+	    (ne_bpf_xdp_detach_fn)(uintptr_t)dlsym(RTLD_DEFAULT,
+						   "bpf_xdp_detach");
+}
+
 static int ne_xdp_attach(int ifindex, int prog_fd, __u32 flags)
 {
-	return ne_rtnl_xdp(ifindex, prog_fd, flags);
+	int r;
+
+	ne_xdp_resolve_syms();
+	if (ne_fn_set_link_xdp_fd)
+		return ne_fn_set_link_xdp_fd(ifindex, prog_fd, flags);
+	if (ne_fn_bpf_xdp_attach)
+		return ne_fn_bpf_xdp_attach(ifindex, prog_fd, flags, NULL);
+	r = ne_rtnl_xdp(ifindex, prog_fd, flags);
+	return r;
 }
 
 static int ne_xdp_detach(int ifindex, __u32 flags)
 {
+	ne_xdp_resolve_syms();
+	if (ne_fn_set_link_xdp_fd)
+		return ne_fn_set_link_xdp_fd(ifindex, -1, flags);
+	if (ne_fn_bpf_xdp_detach)
+		return ne_fn_bpf_xdp_detach(ifindex, flags, NULL);
 	return ne_rtnl_xdp(ifindex, -1, flags);
 }
 
@@ -385,20 +428,40 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 				&p->loc.cq, &ucfg),
 	       "xsk_umem__create");
 
+	NE_CHK(ne_sock_open(p, &p->loc, loc_if), "xsk_socket loc");
 	p->loc.ifindex = if_nametoindex(loc_if);
-	p->wan.ifindex = if_nametoindex(wan_if);
-	p->wan2.ifindex = if_nametoindex(wan2_if);
 	if (!p->loc.ifindex) {
 		fprintf(stderr, "necz1: unknown interface (loc): %s\n", loc_if);
 		goto fail;
 	}
+	NE_CHK(ne_sock_open(p, &p->wan, wan_if), "xsk_socket wan");
+	p->wan.ifindex = if_nametoindex(wan_if);
 	if (!p->wan.ifindex) {
 		fprintf(stderr, "necz1: unknown interface (wan): %s\n", wan_if);
 		goto fail;
 	}
+	NE_CHK(ne_sock_open(p, &p->wan2, wan2_if), "xsk_socket wan2");
+	p->wan2.ifindex = if_nametoindex(wan2_if);
 	if (!p->wan2.ifindex) {
 		fprintf(stderr, "necz1: unknown interface (wan2): %s\n", wan2_if);
 		goto fail;
+	}
+
+	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
+	for (pi = 0; pi < 3; pi++) {
+		struct ne_zc_port *port =
+		    pi == 0 ? &p->loc : (pi == 1 ? &p->wan : &p->wan2);
+
+		for (want = per_fq; want > 0; want--) {
+			if (ne_pool_pop(&p->pool, &a, 1) != 1)
+				break;
+			if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
+				(void)ne_pool_push(&p->pool, &a, 1);
+				break;
+			}
+			*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
+			xsk_ring_prod__submit(&port->fq, 1);
+		}
 	}
 
 	p->bpf_loc = bpf_object__open_file(bpf_loc_o, NULL);
@@ -436,10 +499,6 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	       "xdp attach wan2");
 	p->xdp_wan2_on = 1;
 
-	NE_CHK(ne_sock_open(p, &p->loc, loc_if), "xsk_socket loc");
-	NE_CHK(ne_sock_open(p, &p->wan, wan_if), "xsk_socket wan");
-	NE_CHK(ne_sock_open(p, &p->wan2, wan2_if), "xsk_socket wan2");
-
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
 	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
 	mw2 = bpf_object__find_map_by_name(p->bpf_wan2, "wan_xsks_map");
@@ -455,22 +514,6 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	NE_CHK(ne_xskmap_bind(p->wan2.xsk, bpf_map__fd(mw2)),
 	       "bind wan_xsks_map wan2");
 
-	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
-	for (pi = 0; pi < 3; pi++) {
-		struct ne_zc_port *port =
-		    pi == 0 ? &p->loc : (pi == 1 ? &p->wan : &p->wan2);
-
-		for (want = per_fq; want > 0; want--) {
-			if (ne_pool_pop(&p->pool, &a, 1) != 1)
-				break;
-			if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
-				(void)ne_pool_push(&p->pool, &a, 1);
-				break;
-			}
-			*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
-			xsk_ring_prod__submit(&port->fq, 1);
-		}
-	}
 #undef NE_CHK
 	return 0;
 fail:

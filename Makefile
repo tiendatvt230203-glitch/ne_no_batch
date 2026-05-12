@@ -4,7 +4,7 @@ BPF_CLANG := clang
 BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -Wall -Werror -Wno-unused-value
 
 CFLAGS := -O2 -g -Wall -Wextra -I./inc -D_GNU_SOURCE $(EXTRA_CFLAGS)
-LDFLAGS := -lxdp -lbpf -lelf -lz -lpthread
+LDFLAGS := -lxdp -lbpf -lelf -lz -lpthread -ldl
 
 OBJS := main.o src/interface.o src/threads.o
 BPF_OBJS := bpf/xdp_local.o bpf/xdp_wan.o
