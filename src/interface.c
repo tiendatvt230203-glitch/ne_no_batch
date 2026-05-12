@@ -12,26 +12,33 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/xsk.h>
 
-static int ne_link_xdp_fd(int ifindex, int fd, __u32 flags)
+static int ne_link_xdp_fd(int ifindex, int fd, uint32_t flags)
 {
-	struct bpf_xdp_attach_opts opts = {
-		.sz = sizeof(opts),
-	};
+#ifdef bpf_xdp_attach_opts__last_field
+	struct bpf_xdp_attach_opts opts;
 
+	memset(&opts, 0, sizeof(opts));
+	opts.sz = sizeof(opts);
 	return bpf_xdp_attach(ifindex, fd, flags, &opts);
+#else
+	return bpf_set_link_xdp_fd(ifindex, fd, flags);
+#endif
 }
 
-static int ne_detach_xdp_fd(int ifindex, __u32 flags)
+static int ne_detach_xdp_fd(int ifindex, uint32_t flags)
 {
-	struct bpf_xdp_attach_opts opts = {
-		.sz = sizeof(opts),
-	};
+#ifdef bpf_xdp_attach_opts__last_field
+	struct bpf_xdp_attach_opts opts;
 
+	memset(&opts, 0, sizeof(opts));
+	opts.sz = sizeof(opts);
 	return bpf_xdp_detach(ifindex, flags, &opts);
+#else
+	return bpf_set_link_xdp_fd(ifindex, -1, flags);
+#endif
 }
 
 #include <xdp/libxdp.h>
