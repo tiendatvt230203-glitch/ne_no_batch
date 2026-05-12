@@ -384,40 +384,23 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	NE_CHK(xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->loc.fq,
 				&p->loc.cq, &ucfg),
 	       "xsk_umem__create");
-	NE_CHK(ne_sock_open(p, &p->loc, loc_if), "xsk_socket loc");
+
 	p->loc.ifindex = if_nametoindex(loc_if);
+	p->wan.ifindex = if_nametoindex(wan_if);
+	p->wan2.ifindex = if_nametoindex(wan2_if);
 	if (!p->loc.ifindex) {
 		fprintf(stderr, "necz1: unknown interface (loc): %s\n", loc_if);
 		goto fail;
 	}
-	NE_CHK(ne_sock_open(p, &p->wan, wan_if), "xsk_socket wan");
-	p->wan.ifindex = if_nametoindex(wan_if);
 	if (!p->wan.ifindex) {
 		fprintf(stderr, "necz1: unknown interface (wan): %s\n", wan_if);
 		goto fail;
 	}
-	NE_CHK(ne_sock_open(p, &p->wan2, wan2_if), "xsk_socket wan2");
-	p->wan2.ifindex = if_nametoindex(wan2_if);
 	if (!p->wan2.ifindex) {
 		fprintf(stderr, "necz1: unknown interface (wan2): %s\n", wan2_if);
 		goto fail;
 	}
-	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
-	for (pi = 0; pi < 3; pi++) {
-		struct ne_zc_port *port =
-		    pi == 0 ? &p->loc : (pi == 1 ? &p->wan : &p->wan2);
 
-		for (want = per_fq; want > 0; want--) {
-			if (ne_pool_pop(&p->pool, &a, 1) != 1)
-				break;
-			if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
-				(void)ne_pool_push(&p->pool, &a, 1);
-				break;
-			}
-			*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
-			xsk_ring_prod__submit(&port->fq, 1);
-		}
-	}
 	p->bpf_loc = bpf_object__open_file(bpf_loc_o, NULL);
 	p->bpf_wan = bpf_object__open_file(bpf_wan_o, NULL);
 	p->bpf_wan2 = bpf_object__open_file(bpf_wan_o, NULL);
@@ -452,6 +435,11 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 			   XDP_FLAGS_DRV_MODE),
 	       "xdp attach wan2");
 	p->xdp_wan2_on = 1;
+
+	NE_CHK(ne_sock_open(p, &p->loc, loc_if), "xsk_socket loc");
+	NE_CHK(ne_sock_open(p, &p->wan, wan_if), "xsk_socket wan");
+	NE_CHK(ne_sock_open(p, &p->wan2, wan2_if), "xsk_socket wan2");
+
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
 	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
 	mw2 = bpf_object__find_map_by_name(p->bpf_wan2, "wan_xsks_map");
@@ -466,6 +454,23 @@ int ne_pair_open(struct ne_pair *p, const char *loc_if, const char *wan_if,
 	       "bind wan_xsks_map wan");
 	NE_CHK(ne_xskmap_bind(p->wan2.xsk, bpf_map__fd(mw2)),
 	       "bind wan_xsks_map wan2");
+
+	per_fq = NE_FQ_INIT > ucfg.fill_size ? ucfg.fill_size : NE_FQ_INIT;
+	for (pi = 0; pi < 3; pi++) {
+		struct ne_zc_port *port =
+		    pi == 0 ? &p->loc : (pi == 1 ? &p->wan : &p->wan2);
+
+		for (want = per_fq; want > 0; want--) {
+			if (ne_pool_pop(&p->pool, &a, 1) != 1)
+				break;
+			if (xsk_ring_prod__reserve(&port->fq, 1, &idx) != 1) {
+				(void)ne_pool_push(&p->pool, &a, 1);
+				break;
+			}
+			*xsk_ring_prod__fill_addr(&port->fq, idx) = a;
+			xsk_ring_prod__submit(&port->fq, 1);
+		}
+	}
 #undef NE_CHK
 	return 0;
 fail:
