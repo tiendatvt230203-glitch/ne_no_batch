@@ -4,10 +4,6 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 
-#ifndef IPPROTO_ICMP
-#define IPPROTO_ICMP 1
-#endif
-
 struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);
 	__uint(max_entries, 64);
@@ -34,9 +30,6 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
 
 	iph = data + sizeof(*eth);
 	if ((void *)(iph + 1) > data_end)
-		return XDP_PASS;
-
-	if (iph->protocol == IPPROTO_ICMP)
 		return XDP_PASS;
 
 	return bpf_redirect_map(&wan_xsks_map, 0, 0);
