@@ -7,13 +7,13 @@
 #ifndef IPPROTO_ICMP
 #define IPPROTO_ICMP 1
 #endif
+
 struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);
 	__uint(max_entries, 64);
 	__uint(key_size, sizeof(int));
 	__uint(value_size, sizeof(int));
 } xsks_map SEC(".maps");
-
 
 SEC("xdp")
 int xdp_redirect_prog(struct xdp_md *ctx)
@@ -29,13 +29,16 @@ int xdp_redirect_prog(struct xdp_md *ctx)
 	eth = data;
 	if (eth->h_proto == bpf_htons(ETH_P_ARP))
 		return XDP_PASS;
-	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-		iph = data + sizeof(*eth);
-		if ((void *)(iph + 1) > data_end)
-			return XDP_PASS;
-		if (iph->protocol == IPPROTO_ICMP)
-			return XDP_PASS;
-	}
+	if (eth->h_proto != bpf_htons(ETH_P_IP))
+		return XDP_PASS;
+
+	iph = data + sizeof(*eth);
+	if ((void *)(iph + 1) > data_end)
+		return XDP_PASS;
+
+	if (iph->protocol == IPPROTO_ICMP)
+		return XDP_PASS;
+
 	return bpf_redirect_map(&xsks_map, 0, 0);
 }
 
